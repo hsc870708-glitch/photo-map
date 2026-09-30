@@ -16,7 +16,7 @@
 
 ## 설치
 
-1. [Releases](../../releases)에서 `사진지도.zip`을 받아 압축을 풀어요
+1. [Releases](../../releases)에서 `PhotoMap.zip`을 받아 압축을 풀어요
 2. `사진지도.app`을 **응용 프로그램** 폴더로 옮겨요
 3. **처음 한 번만:** 앱을 **우클릭 → 열기 → 열기**를 눌러요
 
@@ -50,7 +50,7 @@ Xcode 없이 Command Line Tools만 있으면 돼요 (`xcode-select --install`).
 
 ```bash
 ./build.sh     # ~/Applications/사진지도.app 에 설치
-./dist.sh      # 배포용 dist/사진지도.zip (애플 실리콘 + 인텔)
+./dist.sh      # 배포용 dist/PhotoMap.zip (애플 실리콘 + 인텔)
 ```
 
 소스는 `PhotoMap.swift` 파일 하나예요 (SwiftUI + MapKit + Vision).
