@@ -2149,10 +2149,14 @@ final class Enhancer: @unchecked Sendable {
         let sub = dir.appendingPathComponent(String(UUID().uuidString.prefix(8)))
         try? FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
         let out = sub.appendingPathComponent(url.deletingPathExtension().lastPathComponent + ".jpg")
+        // 해상도(DPI)는 72로 맞춘다: 카메라 사진은 350·240dpi라, 줄인 사진을 네이버 블로그가 '인쇄 크기'로 보고 작게 넣는다
         guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
-              (try? ctx.writeJPEGRepresentation(of: img, to: out, colorSpace: cs,
-                  options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.9])) != nil
+              let cg = ctx.createCGImage(img, from: img.extent, format: .RGBA8, colorSpace: cs),
+              let dest = CGImageDestinationCreateWithURL(out as CFURL, "public.jpeg" as CFString, 1, nil)
         else { return url }
+        CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.9,
+                                              kCGImagePropertyDPIWidth: 72, kCGImagePropertyDPIHeight: 72] as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return url }
         lock.lock(); made[key] = out; lock.unlock()
         return out
     }
