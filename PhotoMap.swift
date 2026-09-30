@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 import CryptoKit
 import ImageIO
 import MapKit
@@ -748,6 +749,17 @@ final class Model: ObservableObject {
     // MARK: 썸네일 만들기(전체) / 비우기 — 편집 메뉴
 
     /// 썸네일 위 상태 라벨(추정·지정·직접·강아지 아님·중복) 보기. 보기 메뉴에서 켜고 끈다(영상·RAW 표시는 늘 보임)
+    @Published var enhanceOnDrag = PhotoMap.enhanceOnDrag {
+        didSet {
+            PhotoMap.enhanceOnDrag = enhanceOnDrag
+            UserDefaults.standard.set(enhanceOnDrag, forKey: "enhanceOnDrag")
+            if enhanceOnDrag { Enhancer.shared.warmUp() }
+            notify(enhanceOnDrag ? "드래그할 때 자동 보정해서 넘겨요 (원본은 그대로)" : "드래그할 때 원본을 그대로 넘겨요")
+        }
+    }
+    @Published var enhanceMaxSide = PhotoMap.enhanceMaxSide {
+        didSet { PhotoMap.enhanceMaxSide = enhanceMaxSide; UserDefaults.standard.set(enhanceMaxSide, forKey: "enhanceMaxSide") }
+    }
     @Published var showLabels = UserDefaults.standard.object(forKey: "showLabels") as? Bool ?? true {
         didSet { UserDefaults.standard.set(showLabels, forKey: "showLabels") }
     }
@@ -2079,6 +2091,88 @@ struct Thumb: View {
     }
 }
 
+/// 드래그할 때만 쓰는 자동 보정본. 임시 폴더에 JPG로 만들고, 앱을 켜고 끌 때 비운다(사진 폴더엔 아무것도 안 생긴다)
+final class Enhancer: @unchecked Sendable {
+    static let shared = Enhancer()
+    static let rawExts: Set<String> = ["cr3", "cr2", "nef", "arw", "raf", "orf", "rw2", "dng"]
+    static let imageExts: Set<String> = rawExts.union(["jpg", "jpeg", "heic", "heif", "png", "tif", "tiff"])
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("사진지도-보정")
+    private let ctx = CIContext()
+    private let lock = NSLock()
+    private var made: [String: URL] = [:]
+
+    func clear() {
+        try? FileManager.default.removeItem(at: dir)
+        lock.lock(); made = [:]; lock.unlock()
+    }
+
+    /// 켜자마자 첫 드래그가 느리지 않게 그래픽 처리를 미리 한 번 돌려 둔다
+    func warmUp() {
+        DispatchQueue.global(qos: .utility).async {
+            let img = CIImage(color: .gray).cropped(to: CGRect(x: 0, y: 0, width: 64, height: 64))
+            var out = img
+            for f in img.autoAdjustmentFilters(options: [.redEye: false]) { f.setValue(out, forKey: kCIInputImageKey); out = f.outputImage ?? out }
+            _ = self.ctx.createCGImage(out, from: out.extent)
+        }
+    }
+
+    /// 보정본 파일 주소. 사진이 아니거나(동영상 등) 실패하면 원본을 그대로 돌려준다
+    func enhanced(_ url: URL, maxSide: Double) -> URL {
+        let ext = url.pathExtension.lowercased()
+        guard Self.imageExts.contains(ext) else { return url }
+        let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate?.timeIntervalSince1970 ?? 0
+        let key = "\(url.path)|\(mtime)|\(Int(maxSide))"
+        lock.lock(); let cached = made[key]; lock.unlock()
+        if let c = cached, FileManager.default.fileExists(atPath: c.path) { return c }
+
+        var img: CIImage
+        if Self.rawExts.contains(ext) {
+            guard let f = CIRAWFilter(imageURL: url) else { return url }
+            let long = max(f.nativeSize.width, f.nativeSize.height)
+            if maxSide > 0, long > maxSide { f.scaleFactor = Float(maxSide / long) }
+            guard let o = f.outputImage else { return url }
+            img = o
+        } else {
+            guard let o = CIImage(contentsOf: url, options: [.applyOrientationProperty: true]) else { return url }
+            img = o
+            let long = max(img.extent.width, img.extent.height)
+            if maxSide > 0, long > maxSide {
+                let s = maxSide / long
+                img = img.applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: s, kCIInputAspectRatioKey: 1])
+            }
+        }
+        for f in img.autoAdjustmentFilters(options: [.redEye: false]) {
+            f.setValue(img, forKey: kCIInputImageKey)
+            if let o = f.outputImage { img = o }
+        }
+        // 같은 이름 사진이 여러 폴더에 있어도 겹치지 않게 드래그마다 하위 폴더를 따로 쓴다(블로그엔 원래 파일 이름으로 올라간다)
+        let sub = dir.appendingPathComponent(String(UUID().uuidString.prefix(8)))
+        try? FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        let out = sub.appendingPathComponent(url.deletingPathExtension().lastPathComponent + ".jpg")
+        guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
+              (try? ctx.writeJPEGRepresentation(of: img, to: out, colorSpace: cs,
+                  options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.9])) != nil
+        else { return url }
+        lock.lock(); made[key] = out; lock.unlock()
+        return out
+    }
+
+    /// 여러 장이면 동시에 만든다
+    func enhanced(_ urls: [URL], maxSide: Double) -> [URL] {
+        var out = urls
+        let q = DispatchQueue(label: "enhance.collect")
+        DispatchQueue.concurrentPerform(iterations: urls.count) { i in
+            let u = enhanced(urls[i], maxSide: maxSide)
+            q.sync { out[i] = u }
+        }
+        return out
+    }
+}
+
+/// 드래그 시 자동 보정 설정(드래그하는 AppKit 뷰에서 바로 읽는다)
+var enhanceOnDrag: Bool = pref("enhanceOnDrag", false)
+var enhanceMaxSide: Double = pref("enhanceMaxSide", 2000.0)
+
 /// 썸네일 위에 깔리는 투명한 AppKit 뷰: 클릭은 onClick으로, 끌면 선택한 파일 전체를 Finder·브라우저로 끌어간다
 struct DragClickSource: NSViewRepresentable {
     var onClick: () -> Void
@@ -2117,8 +2211,11 @@ final class DragClickView: NSView, NSDraggingSource {
         let dx = e.locationInWindow.x - d.locationInWindow.x, dy = e.locationInWindow.y - d.locationInWindow.y
         guard dx * dx + dy * dy > 16 else { return }
         down = nil
-        let list = urls?() ?? []
+        var list = urls?() ?? []
         guard !list.isEmpty else { return }
+        if enhanceOnDrag {
+            list = Enhancer.shared.enhanced(list, maxSide: enhanceMaxSide)   // 한 장에 0.1~0.3초
+        }
         let img = image?() ?? NSWorkspace.shared.icon(forFile: list[0].path)
         let items = list.enumerated().map { i, u -> NSDraggingItem in
             let item = NSDraggingItem(pasteboardWriter: u as NSURL)
@@ -2372,6 +2469,9 @@ struct FilterIcons: View {
             FilterIcon(symbol: "1.square", tip: "중복은 1장만 보기", isOn: $model.oneCopyOnly, hover: hover)
             divider
             FilterIcon(symbol: "tag", tip: "사진 라벨 보기 (추정·지정·직접·중복)", isOn: $model.showLabels, hover: hover)
+            divider
+            FilterIcon(symbol: "wand.and.stars", tip: "드래그할 때 자동 보정 (원본은 그대로, 보정본은 임시 파일)",
+                       isOn: $model.enhanceOnDrag, hover: hover)
             Spacer()
             if needsAnalysis && !model.analyzing {
                 Button("분석하기") { model.toggleAnalysis() }.controlSize(.small)
@@ -2872,6 +2972,11 @@ final class Preview: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
 
 /// 훑어보기 창이 응답 체인에서 주인을 찾을 때 앱이 맡는다고 알려준다
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ n: Notification) {
+        Enhancer.shared.clear()
+        if enhanceOnDrag { Enhancer.shared.warmUp() }
+    }
+    func applicationWillTerminate(_ n: Notification) { Enhancer.shared.clear() }
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { true }
     override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
         panel.dataSource = Preview.shared
@@ -2930,6 +3035,19 @@ struct SettingsView: View {
                             .labelsHidden().frame(width: 200)
                     }
                     Toggle("사진 라벨 보기 (추정·지정·직접·중복)", isOn: $model.showLabels)
+                }
+                Section {
+                    Toggle("드래그할 때 자동 보정", isOn: $model.enhanceOnDrag)
+                    Picker("크기", selection: $model.enhanceMaxSide) {
+                        Text("긴 변 1600px").tag(1600.0)
+                        Text("긴 변 2000px (블로그 추천)").tag(2000.0)
+                        Text("긴 변 3000px").tag(3000.0)
+                        Text("원본 크기").tag(0.0)
+                    }
+                    .disabled(!model.enhanceOnDrag)
+                } header: { Text("드래그 보정") } footer: {
+                    Text("블로그·Finder로 끌어갈 때 밝기·대비·색을 자동으로 맞춘 JPG를 넘겨요. RAW(CR3)도 JPG로 바뀌어요. 원본은 바꾸지 않고, 보정본은 임시 파일이라 앱을 끄면 지워져요. 위치(GPS) 정보는 빠져요.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("저장한 썸네일") {
                     LabeledContent("용량", value: model.thumbBytes.map { "\($0 / 1_048_576)MB" } ?? "계산 중…")
@@ -3189,6 +3307,10 @@ struct HelpView: View {
                 작업 메뉴 → **중복 검사**. 파일 내용 전체가 같은 사진만 중복이에요.
                 사본을 모두 골라 지워도 묶음마다 1장은 자동으로 남겨요.
                 """)
+                helpSection("드래그 자동 보정", """
+                🪄 아이콘(⇧⌘E)을 켜면 블로그·Finder로 끌어갈 때 밝기·대비·색을 자동으로 맞춘 JPG(기본 긴 변 2000px)를 넘겨요.
+                원본은 그대로이고, 보정본은 임시 파일이라 앱을 끄면 지워져요. 크기는 설정 → 보기에서 바꿔요.
+                """)
                 helpSection("모으기 · 되돌리기", """
                 작업 막대의 **모으기** → 바로가기(원본 그대로) 또는 복사. 첫 번째 사진 폴더 안 _사진지도/모음/ 에 만들어져요.
                 위치 지정·강아지 구분·휴지통 이동은 **⌘Z**로 되돌릴 수 있어요.
@@ -3278,6 +3400,8 @@ struct PhotoMapApp: App {
                 Divider()
                 Toggle("사진 라벨 보기 (추정·지정·직접·중복)", isOn: $model.showLabels)
                     .keyboardShortcut("l", modifiers: [.command, .shift])
+                Toggle("드래그할 때 자동 보정", isOn: $model.enhanceOnDrag)
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
                 Divider()
                 Button("썸네일 크게") { model.zoomThumbs(16) }.keyboardShortcut("=", modifiers: .command)
                 Button("썸네일 작게") { model.zoomThumbs(-16) }.keyboardShortcut("-", modifiers: .command)
