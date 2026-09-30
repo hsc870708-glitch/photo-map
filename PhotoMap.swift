@@ -2149,13 +2149,17 @@ final class Enhancer: @unchecked Sendable {
         let sub = dir.appendingPathComponent(String(UUID().uuidString.prefix(8)))
         try? FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
         let out = sub.appendingPathComponent(url.deletingPathExtension().lastPathComponent + ".jpg")
-        // 해상도(DPI)는 72로 맞춘다: 카메라 사진은 350·240dpi라, 줄인 사진을 네이버 블로그가 '인쇄 크기'로 보고 작게 넣는다
+        // 원본 크기면 원본의 해상도(DPI)를 그대로, 줄였으면 72dpi로 적는다
+        var dpi: Double = 72
+        if maxSide == 0, let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+           let d = props[kCGImagePropertyDPIWidth] as? Double { dpi = d }
         guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
               let cg = ctx.createCGImage(img, from: img.extent, format: .RGBA8, colorSpace: cs),
               let dest = CGImageDestinationCreateWithURL(out as CFURL, "public.jpeg" as CFString, 1, nil)
         else { return url }
         CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.9,
-                                              kCGImagePropertyDPIWidth: 72, kCGImagePropertyDPIHeight: 72] as CFDictionary)
+                                              kCGImagePropertyDPIWidth: dpi, kCGImagePropertyDPIHeight: dpi] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return url }
         lock.lock(); made[key] = out; lock.unlock()
         return out
@@ -2175,7 +2179,7 @@ final class Enhancer: @unchecked Sendable {
 
 /// 드래그 시 자동 보정 설정(드래그하는 AppKit 뷰에서 바로 읽는다)
 var enhanceOnDrag: Bool = pref("enhanceOnDrag", false)
-var enhanceMaxSide: Double = pref("enhanceMaxSide", 2000.0)
+var enhanceMaxSide: Double = pref("enhanceMaxSide", 0.0)   // 0 = 원본 크기 그대로
 
 /// 썸네일 위에 깔리는 투명한 AppKit 뷰: 클릭은 onClick으로, 끌면 선택한 파일 전체를 Finder·브라우저로 끌어간다
 struct DragClickSource: NSViewRepresentable {
@@ -3043,10 +3047,10 @@ struct SettingsView: View {
                 Section {
                     Toggle("드래그할 때 자동 보정", isOn: $model.enhanceOnDrag)
                     Picker("크기", selection: $model.enhanceMaxSide) {
-                        Text("긴 변 1600px").tag(1600.0)
-                        Text("긴 변 2000px (블로그 추천)").tag(2000.0)
+                        Text("원본 크기 (보정만)").tag(0.0)
                         Text("긴 변 3000px").tag(3000.0)
-                        Text("원본 크기").tag(0.0)
+                        Text("긴 변 2000px").tag(2000.0)
+                        Text("긴 변 1600px").tag(1600.0)
                     }
                     .disabled(!model.enhanceOnDrag)
                 } header: { Text("드래그 보정") } footer: {
@@ -3312,7 +3316,7 @@ struct HelpView: View {
                 사본을 모두 골라 지워도 묶음마다 1장은 자동으로 남겨요.
                 """)
                 helpSection("드래그 자동 보정", """
-                🪄 아이콘(⇧⌘E)을 켜면 블로그·Finder로 끌어갈 때 밝기·대비·색을 자동으로 맞춘 JPG(기본 긴 변 2000px)를 넘겨요.
+                🪄 아이콘(⇧⌘E)을 켜면 블로그·Finder로 끌어갈 때 밝기·대비·색을 자동으로 맞춘 JPG(크기는 원본 그대로)를 넘겨요.
                 원본은 그대로이고, 보정본은 임시 파일이라 앱을 끄면 지워져요. 크기는 설정 → 보기에서 바꿔요.
                 """)
                 helpSection("모으기 · 되돌리기", """
