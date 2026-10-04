@@ -69,6 +69,30 @@ func manualSecond(_ key: String) -> Int? {
 
 enum LocSource: String, Codable { case gps, estimated, manual }
 
+/// EXIF 모델 이름을 알아보기 쉬운 이름으로. 모르는 건 그대로 쓴다
+let cameraAliases: [String: String] = [
+    "Canon EOS R6m2": "Canon EOS R6 Mark II",
+    "ILCE-5000": "Sony α5000", "ILCE-6000": "Sony α6000", "ILCE-7M3": "Sony α7 III",
+    "SM-S921N": "Galaxy S24", "SM-S926N": "Galaxy S24+", "SM-S928N": "Galaxy S24 Ultra",
+    "SM-S911N": "Galaxy S23", "SM-S918N": "Galaxy S23 Ultra", "SM-S901N": "Galaxy S22", "SM-S908N": "Galaxy S22 Ultra",
+    "SM-G991N": "Galaxy S21", "SM-G996N": "Galaxy S21+", "SM-G998N": "Galaxy S21 Ultra",
+    "SM-G981N": "Galaxy S20", "SM-G986N": "Galaxy S20+", "SM-G988N": "Galaxy S20 Ultra",
+    "SM-G973N": "Galaxy S10", "SM-G975N": "Galaxy S10+", "SM-G977N": "Galaxy S10 5G",
+    "SM-G960N": "Galaxy S9", "SM-G965N": "Galaxy S9+", "SM-G950N": "Galaxy S8", "SM-G955N": "Galaxy S8+",
+    "SM-G930L": "Galaxy S7", "SM-G930K": "Galaxy S7", "SM-G930S": "Galaxy S7",
+    "SM-F711N": "Galaxy Z Flip3", "SM-F721N": "Galaxy Z Flip4", "SM-F731N": "Galaxy Z Flip5", "SM-F741N": "Galaxy Z Flip6",
+    "SM-F926N": "Galaxy Z Fold3", "SM-F936N": "Galaxy Z Fold4", "SM-F946N": "Galaxy Z Fold5", "SM-F956N": "Galaxy Z Fold6",
+    "SM-N981N": "Galaxy Note20", "SM-N986N": "Galaxy Note20 Ultra", "SM-N971N": "Galaxy Note10", "SM-N976N": "Galaxy Note10+",
+    "SM-N960N": "Galaxy Note9", "SM-N950N": "Galaxy Note8", "SM-N910L": "Galaxy Note4", "SM-N910K": "Galaxy Note4", "SM-N910S": "Galaxy Note4",
+    "SM-A536N": "Galaxy A53",
+    "LG-F460K": "LG G3 Cat.6", "LG-F460L": "LG G3 Cat.6", "LG-F460S": "LG G3 Cat.6", "LG-F240L": "LG Optimus G Pro",
+]
+func cameraName(_ model: String) -> String {
+    let m = model.trimmingCharacters(in: .whitespaces)
+    if m.isEmpty { return "" }
+    return cameraAliases[m] ?? m
+}
+
 struct Photo: Codable, Identifiable, Hashable {
     let path: String
     var lat: Double?
@@ -82,10 +106,14 @@ struct Photo: Codable, Identifiable, Hashable {
     var mtime: Double? = nil
     /// 강아지가 있는지 분석한 결과. nil이면 아직 분석 안 함. CR3·영상은 분석하지 않고 CR3는 짝 JPG 결과를 쓴다
     var dog: Bool? = nil
+    /// 촬영 기종(EXIF 모델 이름). nil이면 아직 안 읽음, ""이면 정보 없음
+    var cam: String? = nil
 
     // 화면에서 자주 쓰는 값을 한 번만 계산해 둔다(저장하지 않음, prepare()에서 채움).
     // 필터를 바꿀 때마다 6만 장의 경로 문자열을 다시 자르고 날짜를 다시 포맷하면 수백 ms씩 걸렸다
     private var cExt = "", cRel = "", cRelLower = "", cParent = "", cDay = ""
+    /// 화면에 보여줄 기종 이름(예: SM-F711N → Galaxy Z Flip3)
+    private(set) var camera = ""
     // 묶기·정렬용 숫자 키. 한글 경로 문자열로 묶고 정렬하면 6만 장에 수백 ms가 걸려서 숫자로 바꿔 쓴다
     private(set) var time: Double = -.infinity     // 촬영 시각(없으면 맨 앞)
     private(set) var dayID: Int = Int.min          // 현지 날짜(일 단위)
@@ -97,7 +125,7 @@ struct Photo: Codable, Identifiable, Hashable {
     /// 화면에 보여주고 날짜별로 묶을 때 쓰는 날짜(위치 지정 기록은 원래 date 기준이라 그대로 둔다)
     var shownDate: Date? { folderDate ?? date }
 
-    enum CodingKeys: String, CodingKey { case path, lat, lon, date, source, size, hash, mtime, dog }
+    enum CodingKeys: String, CodingKey { case path, lat, lon, date, source, size, hash, mtime, dog, cam }
 
     mutating func prepare() {
         cExt = (path as NSString).pathExtension.lowercased()
@@ -120,6 +148,7 @@ struct Photo: Codable, Identifiable, Hashable {
             dayID = Int((local / 86400).rounded(.down))
         }
         folderID = FolderIDs.id(for: cParent)
+        camera = cameraName(cam ?? "")
     }
 
     var id: String { path }
@@ -231,11 +260,11 @@ enum Scanner {
     }
 
     /// Spotlight 색인이 없는 파일(외장 디스크 등)은 사진 파일의 EXIF를 직접 읽는다. 영상은 지원하지 않는다
-    static func readEXIF(_ path: String) -> (date: Date?, lat: Double?, lon: Double?) {
+    static func readEXIF(_ path: String) -> (date: Date?, lat: Double?, lon: Double?, model: String?) {
         guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
               let props = CGImageSourceCopyPropertiesAtIndex(src, 0, [kCGImageSourceShouldCache: false] as CFDictionary)
                 as? [CFString: Any]
-        else { return (nil, nil, nil) }
+        else { return (nil, nil, nil, nil) }
         var date: Date?
         if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any],
            let s = exif[kCGImagePropertyExifDateTimeOriginal] as? String {
@@ -257,12 +286,14 @@ enum Scanner {
             lat = (g[kCGImagePropertyGPSLatitudeRef] as? String) == "S" ? -la : la
             lon = (g[kCGImagePropertyGPSLongitudeRef] as? String) == "W" ? -lo : lo
         }
-        return (date, lat, lon)
+        let model = (props[kCGImagePropertyTIFFDictionary] as? [CFString: Any])?[kCGImagePropertyTIFFModel] as? String
+        return (date, lat, lon, model)
     }
 
-    /// 파일들의 (날짜, 크기, 위도, 경도) 문자열. 속성은 이름순으로 \0 구분되어 나온다
+    /// 파일들의 (기종, 날짜, 크기, 위도, 경도) 문자열. 속성은 이름순으로 \0 구분되어 나온다
     static func mdls(_ files: [String]) -> [String] {
         let raw = String(decoding: run("/usr/bin/mdls", ["-raw", "-nullMarker", "",
+                                                        "-name", "kMDItemAcquisitionModel",
                                                         "-name", "kMDItemContentCreationDate",
                                                         "-name", "kMDItemFSSize",
                                                         "-name", "kMDItemLatitude",
@@ -327,28 +358,31 @@ enum Scanner {
             let batch = Array(files[start..<min(start + batchSize, files.count)])
             var fields = mdls(batch)
             // 한 파일이라도 읽기 실패하면 순서가 어긋나므로 그 묶음은 한 장씩 다시 읽는다
-            if fields.count != batch.count * 4 {
+            let n = 5
+            if fields.count != batch.count * n {
                 fields = batch.flatMap { f -> [String] in
                     let one = mdls([f])
-                    return one.count == 4 ? one : ["", "", "", ""]
+                    return one.count == n ? one : Array(repeating: "", count: n)
                 }
             }
             for (i, f) in batch.enumerated() {
                 let entry = changed[start + i]
-                var date = fmt.date(from: fields[4 * i])
-                var size = Int64(fields[4 * i + 1])
-                var lat = Double(fields[4 * i + 2]), lon = Double(fields[4 * i + 3])
-                if fields[4 * i].isEmpty && fields[4 * i + 1].isEmpty {
+                var model = fields[n * i].trimmingCharacters(in: .whitespacesAndNewlines)
+                var date = fmt.date(from: fields[n * i + 1])
+                var size = Int64(fields[n * i + 2])
+                var lat = Double(fields[n * i + 3]), lon = Double(fields[n * i + 4])
+                if fields[n * i + 1].isEmpty && fields[n * i + 2].isEmpty {
                     // Spotlight가 모르는 파일
                     size = (try? FileManager.default.attributesOfItem(atPath: f)[.size] as? NSNumber)?.int64Value
                     let ext = (f as NSString).pathExtension.lowercased()
                     if ext != "mp4" && ext != "mov" {
                         let e = readEXIF(f)
-                        date = e.date; lat = e.lat; lon = e.lon
+                        date = e.date; lat = e.lat; lon = e.lon; model = e.model ?? ""
                     }
                 }
                 var p = Photo(path: f, lat: nil, lon: nil, date: date, source: nil, size: entry.size ?? size,
                               mtime: entry.mtime)
+                p.cam = model
                 // 예전 캐시에는 수정 시각이 없다. 크기가 같으면 이미 계산한 중복 해시는 살려 둔다
                 if let old = previous[f], old.size == p.size, old.mtime == nil { p.hash = old.hash }
                 if let lat, let lon, !(lat == 0 && lon == 0) {
@@ -360,7 +394,24 @@ enum Scanner {
             }
             progress(min(start + batchSize, files.count), files.count)
         }
+        fillCameras(&photos, progress: progress)
         return photos
+    }
+
+    /// 예전 캐시에는 기종이 없다. 처음 한 번만 Spotlight에서 기종만 따로 읽어 채운다
+    static func fillCameras(_ photos: inout [Photo], progress: @escaping (Int, Int) -> Void) {
+        let todo = photos.indices.filter { photos[$0].cam == nil }
+        let batchSize = 500
+        for start in stride(from: 0, to: todo.count, by: batchSize) {
+            let idx = Array(todo[start..<min(start + batchSize, todo.count)])
+            let raw = String(decoding: run("/usr/bin/mdls", ["-raw", "-nullMarker", "", "-name", "kMDItemAcquisitionModel"]
+                                                + idx.map { photos[$0].path }), as: UTF8.self)
+            let fields = raw.split(separator: "\0", omittingEmptySubsequences: false)
+            for (k, i) in idx.enumerated() {
+                photos[i].cam = fields.count == idx.count ? fields[k].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+            }
+            progress(min(start + batchSize, todo.count), todo.count)
+        }
     }
 }
 
@@ -496,7 +547,7 @@ final class Model: ObservableObject {
     @Published var radius: Double = pref("radius", 150.0) { didSet { prefs.set(radius, forKey: "radius"); scheduleRecompute() } }
     private var pendingRecompute: Task<Void, Never>?
     @Published var includeRaw: Bool = pref("includeRaw", false) {
-        didSet { prefs.set(includeRaw, forKey: "includeRaw"); recompute(); recomputeUnlocated(); recomputeAll() }
+        didSet { prefs.set(includeRaw, forKey: "includeRaw"); refreshCameras(); recompute(); recomputeUnlocated(); recomputeAll() }
     }
     /// 시간으로 위치 추정하기. 끄면 추정했던 사진은 '위치 없음'으로 돌아간다(탭보다 위의 전체 설정)
     @Published var useEstimate: Bool = pref("useEstimate", true) { didSet { prefs.set(useEstimate, forKey: "useEstimate"); resolve() } }
@@ -595,6 +646,7 @@ final class Model: ObservableObject {
     var pinFilterLabel: String? {
         var parts: [String] = []
         if dogOnly { parts.append("🐶 강아지만") }
+        if !cameraFilter.isEmpty { parts.append("📷 \(cameraFilter)") }
         if mode == .map && estimatedOnly { parts.append("추정만") }
         if mode == .all {
             if allLocFilter == .estimated { parts.append("추정만") }
@@ -606,7 +658,24 @@ final class Model: ObservableObject {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    private var all: [Photo] = []
+    private var all: [Photo] = [] { didSet { refreshCameras() } }
+
+    /// 기종 필터. ""이면 모든 기종, noCamera면 기종 정보 없는 사진만
+    static let noCamera = "기종 정보 없음"
+    @Published var cameraFilter: String = pref("cameraFilter", "") {
+        didSet { prefs.set(cameraFilter, forKey: "cameraFilter"); recompute(); recomputeUnlocated(); recomputeAll() }
+    }
+    /// 기종별 장수(많은 순). 메뉴에 보여준다
+    @Published var cameraCounts: [(name: String, count: Int)] = []
+    private func refreshCameras() {
+        var c: [String: Int] = [:]
+        for p in all where includeRaw || !p.isRaw { c[p.camera.isEmpty ? Model.noCamera : p.camera, default: 0] += 1 }
+        let list = c.map { (name: $0.key, count: $0.value) }.sorted { $0.count > $1.count }
+        if list.map(\.name) != cameraCounts.map(\.name) || list.map(\.count) != cameraCounts.map(\.count) { cameraCounts = list }
+    }
+    func passesCamera(_ p: Photo) -> Bool {
+        cameraFilter.isEmpty || (p.camera.isEmpty ? Model.noCamera : p.camera) == cameraFilter
+    }
     private(set) var located: [Photo] = []
     private var unlocated: [Photo] = []
     private var manual: [String: [Double]] = [:]
@@ -701,7 +770,7 @@ final class Model: ObservableObject {
 
     func needsAnalysis(_ p: Photo) -> Bool { p.dog == nil && analyzableExts.contains(p.ext) }
 
-    func passesContent(_ p: Photo) -> Bool { !dogOnly || p.dog == true }
+    func passesContent(_ p: Photo) -> Bool { (!dogOnly || p.dog == true) && passesCamera(p) }
 
     /// 사진 분석(강아지). 처음엔 오래 걸려서 버튼으로만 시작하고, 중간에 멈춰도 그때까지 결과는 남는다
     func toggleAnalysis() {
@@ -2452,6 +2521,29 @@ struct FilterIcon: View {
 }
 
 /// 필터 아이콘 줄: 강아지 | 위치 추정 | RAW | 중복 | 라벨
+/// 촬영 기종으로 거르는 메뉴(필터 아이콘 줄 오른쪽)
+struct CameraMenu: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        Menu {
+            Button("모든 기종") { model.cameraFilter = "" }
+            Divider()
+            ForEach(model.cameraCounts, id: \.name) { c in
+                Toggle(isOn: Binding(get: { model.cameraFilter == c.name },
+                                     set: { model.cameraFilter = $0 ? c.name : "" })) {
+                    Text("\(c.name)  \(c.count.formatted())장")
+                }
+            }
+        } label: {
+            Label(model.cameraFilter.isEmpty ? "모든 기종" : model.cameraFilter, systemImage: "camera")
+                .foregroundStyle(model.cameraFilter.isEmpty ? Color.secondary : Color.accentColor)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .font(.callout)
+    }
+}
+
 struct FilterIcons: View {
     @ObservedObject var model: Model
     @StateObject private var hover = HoverTip()
@@ -2481,6 +2573,7 @@ struct FilterIcons: View {
             FilterIcon(symbol: "wand.and.stars", tip: "드래그할 때 자동 보정 (원본은 그대로, 보정본은 임시 파일)",
                        isOn: $model.enhanceOnDrag, hover: hover)
             Spacer()
+            CameraMenu(model: model)
             if needsAnalysis && !model.analyzing {
                 Button("분석하기") { model.toggleAnalysis() }.controlSize(.small)
             }
