@@ -640,7 +640,7 @@ final class Model: ObservableObject {
     var pinFilterLabel: String? {
         var parts: [String] = []
         if dogOnly { parts.append("🐶 강아지만") }
-        if !cameraFilter.isEmpty { parts.append("📷 \(cameraFilter)") }
+        if !cameraFilter.isEmpty { parts.append("📷 " + cameraFilterLabel) }
         if mode == .map && estimatedOnly { parts.append("추정만") }
         if mode == .all {
             if allLocFilter == .estimated { parts.append("추정만") }
@@ -656,8 +656,18 @@ final class Model: ObservableObject {
 
     /// 기종 필터. ""이면 모든 기종, noCamera면 기종 정보 없는 사진만
     static let noCamera = "기종 정보 없음"
-    @Published var cameraFilter: String = pref("cameraFilter", "") {
-        didSet { prefs.set(cameraFilter, forKey: "cameraFilter"); recompute(); recomputeUnlocated(); recomputeAll() }
+    /// 고른 기종들(여러 개 가능). 비어 있으면 모든 기종
+    @Published var cameraFilter: Set<String> = Set(pref("cameraFilters", [String]())) {
+        didSet {
+            guard cameraFilter != oldValue else { return }
+            prefs.set(Array(cameraFilter), forKey: "cameraFilters"); recompute(); recomputeUnlocated(); recomputeAll()
+        }
+    }
+    /// 버튼·지도에 보여줄 짧은 설명(예: "Canon EOS R8 외 2")
+    var cameraFilterLabel: String {
+        let names = cameraCounts.map(\.name).filter(cameraFilter.contains)
+        guard let first = names.first ?? cameraFilter.first else { return "모든 기종" }
+        return cameraFilter.count == 1 ? first : "\(first) 외 \(cameraFilter.count - 1)"
     }
     /// 기종별 장수(많은 순). 메뉴에 보여준다
     @Published var cameraCounts: [(name: String, count: Int)] = []
@@ -672,7 +682,7 @@ final class Model: ObservableObject {
         if list.map(\.name) != cameraCounts.map(\.name) || list.map(\.count) != cameraCounts.map(\.count) { cameraCounts = list }
     }
     func passesCamera(_ p: Photo) -> Bool {
-        cameraFilter.isEmpty || (p.camera.isEmpty ? Model.noCamera : p.camera) == cameraFilter
+        cameraFilter.isEmpty || cameraFilter.contains(p.camera.isEmpty ? Model.noCamera : p.camera)
     }
     private(set) var located: [Photo] = []
     private var unlocated: [Photo] = []
@@ -2519,26 +2529,72 @@ struct FilterIcon: View {
 }
 
 /// 필터 아이콘 줄: 강아지 | 위치 추정 | RAW | 중복 | 라벨
-/// 촬영 기종으로 거르는 메뉴(필터 아이콘 줄 오른쪽)
+/// 촬영 기종으로 거르는 버튼(필터 아이콘 줄 오른쪽). 누르면 체크박스 목록이 떠서 여러 기종을 고를 수 있다
 struct CameraMenu: View {
     @ObservedObject var model: Model
+    @StateObject private var open = Flag()
+
     var body: some View {
-        Menu {
-            Button("모든 기종") { model.cameraFilter = "" }
+        Button { open.on.toggle() } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "camera")
+                Text(model.cameraFilterLabel)
+                Image(systemName: "chevron.down").font(.caption2)
+            }
+            .foregroundStyle(model.cameraFilter.isEmpty ? Color.secondary : Color.accentColor)
+        }
+        .buttonStyle(.borderless)
+        .font(.callout)
+        .fixedSize()
+        .popover(isPresented: $open.on, arrowEdge: .bottom) { CameraChecklist(model: model) }
+    }
+}
+
+final class Flag: ObservableObject { @Published var on = false }
+
+struct CameraChecklist: View {
+    @ObservedObject var model: Model
+    static let phones: Set<String> = ["Galaxy", "iPhone", otherCamera]
+
+    var body: some View {
+        let cams = model.cameraCounts.filter { !Self.phones.contains($0.name) && $0.name != Model.noCamera }
+        let phones = model.cameraCounts.filter { Self.phones.contains($0.name) }
+        let none = model.cameraCounts.filter { $0.name == Model.noCamera }
+        VStack(alignment: .leading, spacing: 10) {
+            section("카메라", cams)
+            section("휴대폰", phones)
+            section("", none)
             Divider()
-            ForEach(model.cameraCounts, id: \.name) { c in
-                Toggle(isOn: Binding(get: { model.cameraFilter == c.name },
-                                     set: { model.cameraFilter = $0 ? c.name : "" })) {
-                    Text("\(c.name)  \(c.count.formatted())장")
+            HStack {
+                Button("모두 해제") { model.cameraFilter = [] }.disabled(model.cameraFilter.isEmpty)
+                Spacer()
+                Text(model.cameraFilter.isEmpty ? "체크하지 않으면 모든 기종" : "\(model.cameraFilter.count)개 기종")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .frame(minWidth: 260)
+    }
+
+    @ViewBuilder func section(_ title: String, _ items: [(name: String, count: Int)]) -> some View {
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                if !title.isEmpty { Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary) }
+                ForEach(items, id: \.name) { c in
+                    Toggle(isOn: Binding(get: { model.cameraFilter.contains(c.name) },
+                                         set: { on in
+                                             if on { model.cameraFilter.insert(c.name) } else { model.cameraFilter.remove(c.name) }
+                                         })) {
+                        HStack {
+                            Text(c.name)
+                            Spacer(minLength: 16)
+                            Text(c.count.formatted()).foregroundStyle(.secondary).monospacedDigit()
+                        }
+                    }
+                    .toggleStyle(.checkbox)
                 }
             }
-        } label: {
-            Label(model.cameraFilter.isEmpty ? "모든 기종" : model.cameraFilter, systemImage: "camera")
-                .foregroundStyle(model.cameraFilter.isEmpty ? Color.secondary : Color.accentColor)
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .font(.callout)
     }
 }
 
