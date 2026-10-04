@@ -69,28 +69,22 @@ func manualSecond(_ key: String) -> Int? {
 
 enum LocSource: String, Codable { case gps, estimated, manual }
 
-/// EXIF 모델 이름을 알아보기 쉬운 이름으로. 모르는 건 그대로 쓴다
+/// 기종 메뉴에 쓰는 이름: 카메라는 기종별로, 휴대폰은 Galaxy·iPhone으로 묶고 나머지는 '기타'
 let cameraAliases: [String: String] = [
     "Canon EOS R6m2": "Canon EOS R6 Mark II",
-    "ILCE-5000": "Sony α5000", "ILCE-6000": "Sony α6000", "ILCE-7M3": "Sony α7 III",
-    "SM-S921N": "Galaxy S24", "SM-S926N": "Galaxy S24+", "SM-S928N": "Galaxy S24 Ultra",
-    "SM-S911N": "Galaxy S23", "SM-S918N": "Galaxy S23 Ultra", "SM-S901N": "Galaxy S22", "SM-S908N": "Galaxy S22 Ultra",
-    "SM-G991N": "Galaxy S21", "SM-G996N": "Galaxy S21+", "SM-G998N": "Galaxy S21 Ultra",
-    "SM-G981N": "Galaxy S20", "SM-G986N": "Galaxy S20+", "SM-G988N": "Galaxy S20 Ultra",
-    "SM-G973N": "Galaxy S10", "SM-G975N": "Galaxy S10+", "SM-G977N": "Galaxy S10 5G",
-    "SM-G960N": "Galaxy S9", "SM-G965N": "Galaxy S9+", "SM-G950N": "Galaxy S8", "SM-G955N": "Galaxy S8+",
-    "SM-G930L": "Galaxy S7", "SM-G930K": "Galaxy S7", "SM-G930S": "Galaxy S7",
-    "SM-F711N": "Galaxy Z Flip3", "SM-F721N": "Galaxy Z Flip4", "SM-F731N": "Galaxy Z Flip5", "SM-F741N": "Galaxy Z Flip6",
-    "SM-F926N": "Galaxy Z Fold3", "SM-F936N": "Galaxy Z Fold4", "SM-F946N": "Galaxy Z Fold5", "SM-F956N": "Galaxy Z Fold6",
-    "SM-N981N": "Galaxy Note20", "SM-N986N": "Galaxy Note20 Ultra", "SM-N971N": "Galaxy Note10", "SM-N976N": "Galaxy Note10+",
-    "SM-N960N": "Galaxy Note9", "SM-N950N": "Galaxy Note8", "SM-N910L": "Galaxy Note4", "SM-N910K": "Galaxy Note4", "SM-N910S": "Galaxy Note4",
-    "SM-A536N": "Galaxy A53",
-    "LG-F460K": "LG G3 Cat.6", "LG-F460L": "LG G3 Cat.6", "LG-F460S": "LG G3 Cat.6", "LG-F240L": "LG Optimus G Pro",
+    "ILCE-5000": "Sony α5000", "ILCE-6000": "Sony α6000", "ILCE-6400": "Sony α6400", "ILCE-7M3": "Sony α7 III", "ILCE-7M4": "Sony α7 IV",
 ]
+let otherCamera = "기타"
 func cameraName(_ model: String) -> String {
     let m = model.trimmingCharacters(in: .whitespaces)
     if m.isEmpty { return "" }
-    return cameraAliases[m] ?? m
+    if m.hasPrefix("SM-") || m.hasPrefix("Galaxy") || m.hasPrefix("SHV-") || m.hasPrefix("SHW-") { return "Galaxy" }
+    if m.hasPrefix("iPhone") { return "iPhone" }
+    if let a = cameraAliases[m] { return a }
+    let cameraBrands = ["Canon ", "NIKON", "Nikon", "FUJIFILM", "X-T", "X-S", "X100", "DSC-", "ILCE-", "ILME-",
+                        "E-M", "DC-", "DMC-", "PENTAX", "LEICA", "GR", "RICOH", "HERO", "FC", "DJI"]
+    if cameraBrands.contains(where: { m.hasPrefix($0) }) { return m }
+    return otherCamera
 }
 
 struct Photo: Codable, Identifiable, Hashable {
@@ -670,7 +664,11 @@ final class Model: ObservableObject {
     private func refreshCameras() {
         var c: [String: Int] = [:]
         for p in all where includeRaw || !p.isRaw { c[p.camera.isEmpty ? Model.noCamera : p.camera, default: 0] += 1 }
-        let list = c.map { (name: $0.key, count: $0.value) }.sorted { $0.count > $1.count }
+        let tail = [otherCamera, Model.noCamera]
+        let list = c.map { (name: $0.key, count: $0.value) }.sorted {
+            let ta = tail.firstIndex(of: $0.name) ?? -1, tb = tail.firstIndex(of: $1.name) ?? -1
+            return ta != tb ? ta < tb : $0.count > $1.count
+        }
         if list.map(\.name) != cameraCounts.map(\.name) || list.map(\.count) != cameraCounts.map(\.count) { cameraCounts = list }
     }
     func passesCamera(_ p: Photo) -> Bool {
