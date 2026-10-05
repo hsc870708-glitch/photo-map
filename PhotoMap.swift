@@ -803,6 +803,31 @@ final class Model: ObservableObject {
     }
     @Published var job: Job?
 
+    /// 무거운 작업(분석·중복 검사·썸네일)은 한 번에 하나씩. 하는 중에 또 누르면 줄을 세워 두고 끝나면 이어서 한다
+    enum QueuedJob: String { case analysis = "사진 분석", duplicates = "중복 검사", thumbs = "썸네일 만들기" }
+    @Published var queue: [QueuedJob] = []
+    var busy: Bool { analyzing || buildingThumbs || checkingDuplicates }
+
+    /// 다른 작업 중이면 줄에 세우고 true
+    private func enqueue(_ j: QueuedJob) -> Bool {
+        guard busy else { return false }
+        if !queue.contains(j) { queue.append(j) }
+        notify("지금 작업이 끝나면 \(j.rawValue)\(j == .duplicates ? "를" : "을") 이어서 할게요")
+        return true
+    }
+
+    /// 작업 하나가 끝날 때마다 부른다
+    private func runNext() {
+        guard !busy, !queue.isEmpty else { return }
+        switch queue.removeFirst() {
+        case .analysis: toggleAnalysis()
+        case .duplicates: checkDuplicates()
+        case .thumbs: buildAllThumbs()
+        }
+    }
+
+    func cancelQueue() { queue = []; notify("기다리던 작업을 취소했어요") }
+
     private func updateJob(_ title: String, _ done: Int, _ total: Int, canStop: Bool = false) {
         if job?.title == title { job?.done = done; job?.total = total }
         else { job = Job(title: title, done: done, total: total, canStop: canStop) }
@@ -826,7 +851,8 @@ final class Model: ObservableObject {
     /// 사진 분석(강아지). 처음엔 오래 걸려서 버튼으로만 시작하고, 중간에 멈춰도 그때까지 결과는 남는다
     func toggleAnalysis() {
         if analyzing { stopAnalysis = true; notify("분석 멈추는 중…"); return }
-        guard !buildingThumbs else { notify("썸네일을 다 만든 뒤에 분석할 수 있어요"); return }
+        if let i = queue.firstIndex(of: .analysis) { queue.remove(at: i); notify("사진 분석 대기를 취소했어요"); return }
+        if enqueue(.analysis) { return }
         let todo = all.filter(needsAnalysis).map(\.path)
         guard !todo.isEmpty else { notify("분석할 새 사진이 없어요"); return }
         analyzing = true
@@ -856,6 +882,7 @@ final class Model: ObservableObject {
                 self.saveCache()
                 self.resolve()
                 self.notify("사진 분석 \(done.formatted())장 완료")
+                self.runNext()
             }
         }
     }
@@ -895,7 +922,7 @@ final class Model: ObservableObject {
 
     func buildAllThumbs() {
         guard !buildingThumbs else { return }
-        guard !analyzing else { notify("사진 분석이 끝난 뒤에 만들 수 있어요"); return }
+        if enqueue(.thumbs) { return }
         let todo = all.filter { !$0.isVideo }
         buildingThumbs = true
         stopThumbs = false
@@ -918,6 +945,7 @@ final class Model: ObservableObject {
                 self.buildingThumbs = false
                 self.job = nil
                 self.notify("썸네일 \(d.formatted())장 준비 완료 · 이제 처음 보는 사진도 바로 떠요")
+                self.runNext()
             }
         }
     }
@@ -941,6 +969,7 @@ final class Model: ObservableObject {
     /// 무거운 작업이라 켤 때 자동으로 하지 않고 버튼으로만 돌린다. 결과는 저장해 두고 다음부터 재사용한다
     func checkDuplicates() {
         guard !checkingDuplicates else { return }
+        if enqueue(.duplicates) { return }
         checkingDuplicates = true
         var list = all
         updateJob("📄 중복 검사 중", 0, 0)
@@ -963,6 +992,7 @@ final class Model: ObservableObject {
                 self.job = nil
                 self.resolve()
                 self.notify("중복 검사 완료 · 중복 \(self.duplicateCount.formatted())묶음")
+                self.runNext()
             }
         }
     }
@@ -2442,6 +2472,15 @@ struct JobBanner: View {
                 if let r = job.remaining { Text(r) }
             }
             .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            if !model.queue.isEmpty {
+                HStack {
+                    Image(systemName: "clock")
+                    Text("다음: " + model.queue.map(\.rawValue).joined(separator: " → "))
+                    Spacer()
+                    Button("대기 취소") { model.cancelQueue() }.controlSize(.small)
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.12)))
@@ -2978,14 +3017,16 @@ struct WorkMenuItems: View {
             .keyboardShortcut(shortcuts ? KeyboardShortcut("r", modifiers: .command) : nil)
         Divider()
         Button(model.analyzing ? "🐾 사진 분석 멈추기"
+               : model.queue.contains(.analysis) ? "🐾 사진 분석 (대기 중 · 누르면 취소)"
                : (model.unanalyzedCount > 0 ? "🐾 사진 분석 (\(model.unanalyzedCount.formatted())장 남음)" : "🐾 사진 분석 (모두 끝남)")) {
             model.toggleAnalysis()
         }
         .disabled(!model.analyzing && model.unanalyzedCount == 0)
-        Button(model.uncheckedDuplicates > 0 ? "📄 중복 검사 (\(model.uncheckedDuplicates.formatted())개 확인 필요)" : "📄 중복 검사") {
+        Button(model.queue.contains(.duplicates) ? "📄 중복 검사 (대기 중)"
+               : model.uncheckedDuplicates > 0 ? "📄 중복 검사 (\(model.uncheckedDuplicates.formatted())개 확인 필요)" : "📄 중복 검사") {
             model.checkDuplicates()
         }
-        .disabled(model.checkingDuplicates)
+        .disabled(model.checkingDuplicates || model.queue.contains(.duplicates))
         Divider()
         Button("사진 폴더 관리…") { openSettings() }
     }
@@ -3552,7 +3593,7 @@ struct SettingsView: View {
                 Section("저장한 썸네일") {
                     LabeledContent("용량", value: model.thumbBytes.map { "\($0 / 1_048_576)MB" } ?? "계산 중…")
                     HStack {
-                        Button("전체 만들기") { model.buildAllThumbs() }.disabled(model.buildingThumbs || model.analyzing)
+                        Button("전체 만들기") { model.buildAllThumbs() }.disabled(model.buildingThumbs || model.queue.contains(.thumbs))
                         Button("비우기") { model.clearThumbs(); model.refreshThumbBytes() }.disabled(model.buildingThumbs)
                     }
                 }
@@ -3891,7 +3932,7 @@ struct PhotoMapApp: App {
                 Toggle("중복 기준: 파일 이름까지 같아야 중복", isOn: $model.sameNameOnly)
                 Divider()
                 Button(model.buildingThumbs ? "썸네일 만드는 중…" : "썸네일 만들기 (전체)") { model.buildAllThumbs() }
-                    .disabled(model.buildingThumbs || model.analyzing)
+                    .disabled(model.buildingThumbs || model.queue.contains(.thumbs))
                 Button("썸네일 비우기") { model.clearThumbs() }
                     .disabled(model.buildingThumbs)
             }
