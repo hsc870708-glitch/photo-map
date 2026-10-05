@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import CoreImage
 import CryptoKit
 import ImageIO
@@ -2052,6 +2053,7 @@ func tagLabel(_ text: String, _ color: Color) -> some View {
 }
 
 struct Thumb: View {
+    @Environment(\.openWindow) private var openWindow
     let photo: Photo
     var isSelected = false
     /// 클릭(선택 규칙과 더블클릭 열기는 Model.click이 처리한다)
@@ -2120,6 +2122,9 @@ struct Thumb: View {
             .contextMenu {
                 Button("열기") { NSWorkspace.shared.open(photo.url) }
                 Button("Finder에서 보기") { NSWorkspace.shared.activateFileViewerSelecting([photo.url]) }
+                if photo.isVideo {
+                    Button("GIF 만들기…") { GIFJob.shared.load(photo.url); openWindow(id: "gif") }
+                }
                 if let onShowOnMap, photo.lat != nil {
                     Button("장소 탭에서 위치 보기", action: onShowOnMap)
                 }
@@ -3129,9 +3134,10 @@ final class Preview: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         Enhancer.shared.clear()
+        try? FileManager.default.removeItem(at: GIFJob.dir)
         if enhanceOnDrag { Enhancer.shared.warmUp() }
     }
-    func applicationWillTerminate(_ n: Notification) { Enhancer.shared.clear() }
+    func applicationWillTerminate(_ n: Notification) { Enhancer.shared.clear(); try? FileManager.default.removeItem(at: GIFJob.dir) }
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { true }
     override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
         panel.dataSource = Preview.shared
@@ -3139,6 +3145,275 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {}
 }
+
+// MARK: - GIF 만들기 (동영상 → 용량 제한에 맞춰 여러 장으로 나눈 GIF)
+
+enum GIFEncoder {
+    /// 여러 장면을 하나의 움직이는 GIF로
+    static func data(_ frames: [CGImage], delay: Double) -> Data? {
+        let data = NSMutableData()
+        guard let d = CGImageDestinationCreateWithData(data, "com.compuserve.gif" as CFString, frames.count, nil) else { return nil }
+        CGImageDestinationSetProperties(d, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+        let frameProps = [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: delay,
+                                                          kCGImagePropertyGIFUnclampedDelayTime: delay]] as CFDictionary
+        for f in frames { CGImageDestinationAddImage(d, f, frameProps) }
+        guard CGImageDestinationFinalize(d) else { return nil }
+        return data as Data
+    }
+
+    /// 용량 제한(바이트)을 넘지 않게 장면을 앞에서부터 묶어 여러 GIF로 나눈다.
+    /// 장면 하나씩 GIF로 만들어 본 크기를 더해 어림하고, 실제로 만든 뒤 넘치면 뒤쪽 장면을 다음 장으로 넘긴다
+    static func split(_ frames: [CGImage], delay: Double, limit: Int,
+                      progress: (Double) -> Void) -> [(data: Data, first: Int, count: Int)] {
+        let sizes = frames.enumerated().map { i, f -> Int in
+            if i % 10 == 0 { progress(0.5 * Double(i) / Double(frames.count)) }
+            return data([f], delay: delay)?.count ?? 0
+        }
+        var parts: [(Data, Int, Int)] = []
+        var start = 0
+        while start < frames.count {
+            var end = start, acc = 0
+            while end < frames.count, end == start || acc + sizes[end] <= Int(Double(limit) * 0.97) {
+                acc += sizes[end]; end += 1
+            }
+            var out = data(Array(frames[start..<end]), delay: delay)
+            while let o = out, o.count > limit, end - start > 1 {
+                end = start + max(1, Int(Double(end - start) * 0.9))
+                out = data(Array(frames[start..<end]), delay: delay)
+            }
+            if let o = out { parts.append((o, start, end - start)) }
+            start = end
+            progress(0.5 + 0.5 * Double(start) / Double(frames.count))
+        }
+        return parts
+    }
+}
+
+@MainActor
+final class GIFJob: ObservableObject {
+    static let shared = GIFJob()
+    /// 만든 GIF는 임시 폴더에 둔다(앱을 켜고 끌 때 비운다). 블로그로 끌어 넣거나 '다운로드에 저장'으로 남긴다
+    nonisolated static let dir = FileManager.default.temporaryDirectory.appendingPathComponent("사진지도-GIF")
+
+    struct Part: Identifiable {
+        let id = UUID()
+        let url: URL
+        let bytes: Int
+        let from: Double
+        let to: Double
+    }
+
+    @Published var source: URL?
+    @Published var duration: Double = 0
+    @Published var start: Double = 0
+    @Published var length: Double = 10
+    @Published var longSide: Int = pref("gifLongSide", 480) { didSet { prefs.set(longSide, forKey: "gifLongSide") } }
+    @Published var fps: Int = pref("gifFPS", 10) { didSet { prefs.set(fps, forKey: "gifFPS") } }
+    @Published var limitMB: Double = pref("gifLimitMB", 10.0) { didSet { prefs.set(limitMB, forKey: "gifLimitMB") } }
+    @Published var working = false
+    @Published var progress: Double = 0
+    @Published var status = ""
+    @Published var parts: [Part] = []
+    private var task: Task<Void, Never>?
+
+    /// 장면이 너무 많으면 메모리가 커지므로 한 번에 만드는 길이를 제한한다
+    var maxLength: Double { 900.0 / Double(fps) }
+
+    func load(_ url: URL) {
+        task?.cancel()
+        source = url; parts = []; status = ""; working = false; progress = 0
+        start = 0; duration = 0
+        Task {
+            let d = (try? await AVURLAsset(url: url).load(.duration).seconds) ?? 0
+            guard source == url else { return }
+            duration = d.isFinite ? d : 0
+            length = min(duration, 10)
+        }
+    }
+
+    func cancel() { task?.cancel() }
+
+    func make() {
+        guard let url = source, duration > 0 else { return }
+        let from = max(0, min(start, duration)), to = min(duration, from + min(length, maxLength))
+        guard to > from else { return }
+        let fps = Double(self.fps), side = CGFloat(longSide), limit = Int(limitMB * 1_000_000)
+        working = true; progress = 0; parts = []; status = "장면 뽑는 중…"
+        task = Task.detached(priority: .userInitiated) {
+            let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+            gen.appliesPreferredTrackTransform = true
+            gen.maximumSize = CGSize(width: side, height: side)
+            let tol = CMTime(seconds: 0.5 / fps, preferredTimescale: 600)
+            gen.requestedTimeToleranceBefore = tol
+            gen.requestedTimeToleranceAfter = tol
+            let times = stride(from: from, to: to, by: 1 / fps).map { CMTime(seconds: $0, preferredTimescale: 600) }
+            var frames: [CGImage] = []
+            for await r in gen.images(for: times) {
+                if Task.isCancelled { break }
+                if let img = try? r.image { frames.append(img) }
+                let n = frames.count
+                if n % 10 == 0 { await MainActor.run { self.progress = 0.4 * Double(n) / Double(times.count) } }
+            }
+            if Task.isCancelled || frames.isEmpty {
+                await MainActor.run { self.working = false; self.status = frames.isEmpty ? "장면을 읽지 못했어요" : "멈췄어요" }
+                return
+            }
+            await MainActor.run { self.status = "GIF 만드는 중…" }
+            let made = GIFEncoder.split(frames, delay: 1 / fps, limit: limit) { f in
+                Task { @MainActor in self.progress = 0.4 + 0.6 * f }
+            }
+            let sub = GIFJob.dir.appendingPathComponent(String(UUID().uuidString.prefix(8)))
+            try? FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+            let base = url.deletingPathExtension().lastPathComponent
+            var out: [Part] = []
+            for (i, p) in made.enumerated() {
+                let name = made.count == 1 ? "\(base).gif" : "\(base)_\(i + 1).gif"
+                let file = sub.appendingPathComponent(name)
+                guard (try? p.data.write(to: file)) != nil else { continue }
+                out.append(Part(url: file, bytes: p.data.count,
+                                from: from + Double(p.first) / fps, to: from + Double(p.first + p.count) / fps))
+            }
+            await MainActor.run {
+                self.parts = out; self.working = false; self.progress = 1
+                self.status = out.count > 1
+                    ? "\(String(format: "%.0f", self.limitMB))MB를 넘지 않게 \(out.count)장으로 나눴어요"
+                    : "다 만들었어요"
+            }
+        }
+    }
+
+    func saveToDownloads() {
+        let dl = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        var saved: [URL] = []
+        for p in parts {
+            var dest = dl.appendingPathComponent(p.url.lastPathComponent)
+            var n = 2
+            while FileManager.default.fileExists(atPath: dest.path) {
+                dest = dl.appendingPathComponent(p.url.deletingPathExtension().lastPathComponent + " \(n).gif"); n += 1
+            }
+            if (try? FileManager.default.copyItem(at: p.url, to: dest)) != nil { saved.append(dest) }
+        }
+        if !saved.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(saved) }
+    }
+}
+
+/// 움직이는 GIF 미리보기
+struct AnimatedImage: NSViewRepresentable {
+    let url: URL
+    func makeNSView(context: Context) -> NSImageView {
+        let v = NSImageView()
+        v.animates = true
+        v.imageScaling = .scaleProportionallyDown
+        v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        v.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        return v
+    }
+    func updateNSView(_ v: NSImageView, context: Context) {
+        if v.image == nil || (v.toolTip ?? "") != url.path {
+            v.image = NSImage(contentsOf: url)
+            v.toolTip = url.path
+        }
+    }
+}
+
+struct GIFView: View {
+    @ObservedObject var job: GIFJob
+    @StateObject private var preview = GIFPreviewPick()
+
+    func sec(_ v: Double) -> String { String(format: "%.1f초", v) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let src = job.source {
+                Label(src.lastPathComponent, systemImage: "film").font(.headline)
+                Form {
+                    LabeledContent("영상 길이", value: job.duration > 0 ? sec(job.duration) : "읽는 중…")
+                    LabeledContent("시작") {
+                        HStack {
+                            Slider(value: $job.start, in: 0...max(job.duration, 0.1))
+                            Text(sec(job.start)).monospacedDigit().frame(width: 52, alignment: .trailing)
+                        }
+                    }
+                    LabeledContent("길이") {
+                        HStack {
+                            Slider(value: $job.length, in: 0.5...max(min(job.maxLength, job.duration), 0.6))
+                            Text(sec(min(job.length, max(0, job.duration - job.start))))
+                                .monospacedDigit().frame(width: 52, alignment: .trailing)
+                        }
+                    }
+                    Picker("크기 (긴 변)", selection: $job.longSide) {
+                        ForEach([320, 480, 640, 800], id: \.self) { Text("\($0)px").tag($0) }
+                    }
+                    Picker("부드러움", selection: $job.fps) {
+                        Text("초당 8장 (가벼움)").tag(8)
+                        Text("초당 10장").tag(10)
+                        Text("초당 15장").tag(15)
+                        Text("초당 20장 (부드러움)").tag(20)
+                    }
+                    Picker("한 장 최대 용량", selection: $job.limitMB) {
+                        ForEach([5.0, 10.0, 15.0, 20.0], id: \.self) { Text("\(Int($0))MB").tag($0) }
+                    }
+                }
+                .formStyle(.grouped)
+                .disabled(job.working)
+
+                HStack {
+                    if job.working {
+                        ProgressView(value: job.progress).frame(maxWidth: .infinity)
+                        Button("멈추기") { job.cancel() }
+                    } else {
+                        Text(job.status).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("GIF 만들기") { job.make() }
+                            .keyboardShortcut(.defaultAction)
+                            .disabled(job.duration == 0)
+                    }
+                }
+
+                if !job.parts.isEmpty {
+                    Divider()
+                    let shown = job.parts.first { $0.id == preview.id } ?? job.parts[0]
+                    AnimatedImage(url: shown.url)
+                        .frame(maxWidth: .infinity, minHeight: 160, maxHeight: 240)
+                    Text("아래 GIF를 블로그로 바로 끌어다 넣을 수 있어요").font(.caption).foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(spacing: 4) {
+                            ForEach(Array(job.parts.enumerated()), id: \.element.id) { i, p in
+                                HStack {
+                                    Image(systemName: "photo.on.rectangle").foregroundStyle(.tint)
+                                    Text(job.parts.count > 1 ? "\(i + 1)번" : "GIF").fontWeight(.medium)
+                                    Text("\(sec(p.from)) ~ \(sec(p.to))").foregroundStyle(.secondary).monospacedDigit()
+                                    Spacer()
+                                    Text(String(format: "%.1fMB", Double(p.bytes) / 1_000_000)).monospacedDigit()
+                                }
+                                .padding(.horizontal, 10).padding(.vertical, 6)
+                                .background(p.id == shown.id ? Color.accentColor.opacity(0.15) : Color.gray.opacity(0.08),
+                                            in: RoundedRectangle(cornerRadius: 6))
+                                .overlay {
+                                    DragClickSource(onClick: { preview.id = p.id }, urls: { [p.url] },
+                                                    image: { NSImage(contentsOf: p.url) })
+                                }
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 180)
+                    HStack {
+                        Spacer()
+                        Button("다운로드 폴더에 저장") { job.saveToDownloads() }
+                    }
+                }
+            } else {
+                Text("사진 목록에서 동영상을 우클릭 → GIF 만들기…를 고르세요")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 120)
+            }
+        }
+        .padding(18)
+        .frame(width: 460)
+    }
+}
+
+final class GIFPreviewPick: ObservableObject { @Published var id: UUID? }
 
 // MARK: - 설정 창 (⌘,)
 
@@ -3466,6 +3741,10 @@ struct HelpView: View {
                 🪄 아이콘(⇧⌘E)을 켜면 블로그·Finder로 끌어갈 때 밝기·대비·색을 자동으로 맞춘 JPG(크기는 원본 그대로)를 넘겨요.
                 원본은 그대로이고, 보정본은 임시 파일이라 앱을 끄면 지워져요. 크기는 설정 → 보기에서 바꿔요.
                 """)
+                helpSection("동영상 → GIF", """
+                동영상을 우클릭 → **GIF 만들기…** 시작·길이·크기·부드러움을 고르고 만들면,
+                **한 장 최대 용량**(기본 10MB)을 넘지 않게 자동으로 1번·2번…으로 나눠요. 목록에서 블로그로 바로 끌어다 넣어요.
+                """)
                 helpSection("모으기 · 되돌리기", """
                 작업 막대의 **모으기** → 바로가기(원본 그대로) 또는 복사. 첫 번째 사진 폴더 안 _사진지도/모음/ 에 만들어져요.
                 위치 지정·강아지 구분·휴지통 이동은 **⌘Z**로 되돌릴 수 있어요.
@@ -3570,6 +3849,11 @@ struct PhotoMapApp: App {
         }
         .windowResizability(.contentSize)
         .defaultPosition(.topTrailing)
+
+        Window("GIF 만들기", id: "gif") {
+            GIFView(job: GIFJob.shared)
+        }
+        .windowResizability(.contentSize)
 
         Window("사진지도 도움말", id: "help") {
             HelpView()
