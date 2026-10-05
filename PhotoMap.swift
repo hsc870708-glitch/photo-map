@@ -641,6 +641,7 @@ final class Model: ObservableObject {
     var pinFilterLabel: String? {
         var parts: [String] = []
         if dogOnly { parts.append("🐶 강아지만") }
+        if videoOnly { parts.append("🎬 동영상만") }
         if !cameraFilter.isEmpty { parts.append("📷 " + cameraFilterLabel) }
         if mode == .map && estimatedOnly { parts.append("추정만") }
         if mode == .all {
@@ -779,7 +780,10 @@ final class Model: ObservableObject {
 
     func needsAnalysis(_ p: Photo) -> Bool { p.dog == nil && analyzableExts.contains(p.ext) }
 
-    func passesContent(_ p: Photo) -> Bool { (!dogOnly || p.dog == true) && passesCamera(p) }
+    func passesContent(_ p: Photo) -> Bool { (!dogOnly || p.dog == true) && (!videoOnly || p.isVideo) && passesCamera(p) }
+    @Published var videoOnly: Bool = pref("videoOnly", false) {
+        didSet { prefs.set(videoOnly, forKey: "videoOnly"); recompute(); recomputeUnlocated(); recomputeAll() }
+    }
 
     /// 사진 분석(강아지). 처음엔 오래 걸려서 버튼으로만 시작하고, 중간에 멈춰도 그때까지 결과는 남는다
     func toggleAnalysis() {
@@ -2042,6 +2046,22 @@ final class ThumbCache {
 // 이 환경(CommandLineTools)에는 @State 매크로 플러그인이 없어서 작은 ObservableObject로 대신한다
 final class ThumbLoader: ObservableObject {
     @Published var image: NSImage?
+    @Published var duration: Double?
+}
+
+/// 동영상 길이(초). 한 번 읽은 건 기억한다
+enum VideoDurations {
+    @MainActor static var cache: [String: Double] = [:]
+    @MainActor static func load(_ url: URL) async -> Double? {
+        if let d = cache[url.path] { return d }
+        guard let d = try? await AVURLAsset(url: url).load(.duration).seconds, d.isFinite else { return nil }
+        cache[url.path] = d
+        return d
+    }
+    static func text(_ d: Double) -> String {
+        let s = Int(d.rounded())
+        return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60) : String(format: "%d:%02d", s / 60, s % 60)
+    }
 }
 
 func tagLabel(_ text: String, _ color: Color) -> some View {
@@ -2081,8 +2101,16 @@ struct Thumb: View {
             .overlay {
                 if let image = loader.image { Image(nsImage: image).resizable().scaledToFill() }
             }
+            .overlay {
+                if photo.isVideo {
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.white.opacity(0.95), .black.opacity(0.45))
+                        .shadow(radius: 2)
+                }
+            }
             .overlay(alignment: .bottomTrailing) {
-                if photo.isVideo { tagLabel("영상", .black.opacity(0.6)) }
+                if photo.isVideo { tagLabel("▶ " + (loader.duration.map(VideoDurations.text) ?? "영상"), .black.opacity(0.65)) }
                 else if photo.isRaw { tagLabel("RAW", .black.opacity(0.6)) }
             }
             .overlay(alignment: .topLeading) {
@@ -2151,7 +2179,10 @@ struct Thumb: View {
                     Button(trashTitle, role: .destructive, action: onTrash)
                 }
             }
-            .task(id: photo.path) { loader.image = await load() }
+            .task(id: photo.path) {
+                loader.image = await load()
+                if photo.isVideo { loader.duration = await VideoDurations.load(photo.url) }
+            }
     }
 
     func load() async -> NSImage? {
@@ -2623,6 +2654,7 @@ struct FilterIcons: View {
             }
             divider
             FilterIcon(symbol: "camera.aperture", tip: "RAW(CR3)도 함께 보기", isOn: $model.includeRaw, hover: hover)
+            FilterIcon(symbol: "film", tip: "동영상만 보기", isOn: $model.videoOnly, hover: hover)
             divider
             FilterIcon(symbol: "square.on.square", tip: "중복 사진만 보기", isOn: $model.duplicatesOnly, hover: hover)
             FilterIcon(symbol: "1.square", tip: "중복은 1장만 보기", isOn: $model.oneCopyOnly, hover: hover)
