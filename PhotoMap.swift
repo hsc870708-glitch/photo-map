@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import AVKit
 import CoreImage
 import CryptoKit
 import ImageIO
@@ -3257,7 +3258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {}
 }
 
-// MARK: - GIF 만들기 (동영상 → 용량 제한에 맞춰 여러 장으로 나눈 GIF)
+// MARK: - GIF 만들기 (동영상 → 용량 제한에 맞춘 GIF: 여러 장으로 나누거나 한 장에 맞추기)
 
 enum GIFEncoder {
     /// 여러 장면을 하나의 움직이는 GIF로
@@ -3298,6 +3299,36 @@ enum GIFEncoder {
         }
         return parts
     }
+
+    static func scaled(_ img: CGImage, _ s: Double) -> CGImage {
+        let w = max(1, Int(Double(img.width) * s)), h = max(1, Int(Double(img.height) * s))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return img }
+        ctx.interpolationQuality = .high
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage() ?? img
+    }
+
+    /// 한 장에 맞추기: 넘치면 장면 수(부드러움)를 먼저 줄이고, 그래도 넘치면 크기를 줄인다
+    static func fitOne(_ frames: [CGImage], fps: Double, limit: Int,
+                       progress: (Double) -> Void) -> (data: Data, fps: Double, scale: Double)? {
+        var step = 1, scale = 1.0
+        for attempt in 0..<8 {
+            progress(Double(attempt) / 8)
+            let picked = stride(from: 0, to: frames.count, by: step).map { frames[$0] }
+            let used = scale < 0.999 ? picked.map { scaled($0, scale) } : picked
+            let f = fps / Double(step)
+            guard let d = data(used, delay: 1 / f) else { return nil }
+            if d.count <= limit { return (d, f, scale) }
+            let r = Double(d.count) / Double(limit)
+            // 초당 8장 아래로는 끊겨 보여서 장면 수는 거기까지만 줄인다
+            if r > 1.6, fps / Double(step * 2) >= 7.5 { step *= 2; continue }
+            scale *= max(0.4, min(0.92, (1 / r).squareRoot() * 0.95))
+            if Double(frames[0].width) * scale < 120 { break }
+        }
+        return nil
+    }
 }
 
 @MainActor
@@ -3315,40 +3346,93 @@ final class GIFJob: ObservableObject {
     }
 
     @Published var source: URL?
+    @Published var player: AVPlayer?
     @Published var duration: Double = 0
-    @Published var start: Double = 0
-    @Published var length: Double = 10
+    @Published var start: Double = 0 { didSet { if start != oldValue { seek(start) } } }
+    @Published var end: Double = 0 { didSet { if end != oldValue { seek(end) } } }
     @Published var longSide: Int = pref("gifLongSide", 480) { didSet { prefs.set(longSide, forKey: "gifLongSide") } }
     @Published var fps: Int = pref("gifFPS", 10) { didSet { prefs.set(fps, forKey: "gifFPS") } }
     @Published var limitMB: Double = pref("gifLimitMB", 10.0) { didSet { prefs.set(limitMB, forKey: "gifLimitMB") } }
+    /// 용량을 넘으면: false = 여러 장으로 나누기, true = 한 장에 맞추기(부드러움·크기를 자동으로 줄임)
+    @Published var fitOne: Bool = pref("gifFitOne", false) { didSet { prefs.set(fitOne, forKey: "gifFitOne") } }
     @Published var working = false
     @Published var progress: Double = 0
     @Published var status = ""
     @Published var parts: [Part] = []
     private var task: Task<Void, Never>?
+    private var boundary: Any?
 
     /// 장면이 너무 많으면 메모리가 커지므로 한 번에 만드는 길이를 제한한다
     var maxLength: Double { 900.0 / Double(fps) }
+    var length: Double { max(0, end - start) }
 
     func load(_ url: URL) {
         task?.cancel()
+        stopRange()
         source = url; parts = []; status = ""; working = false; progress = 0
-        start = 0; duration = 0
+        duration = 0
+        player = AVPlayer(url: url)
         Task {
             let d = (try? await AVURLAsset(url: url).load(.duration).seconds) ?? 0
             guard source == url else { return }
             duration = d.isFinite ? d : 0
-            length = min(duration, 10)
+            start = 0
+            end = min(duration, 5)
+            seek(0)
         }
+    }
+
+    private func seek(_ t: Double) {
+        guard let p = player, !working else { return }
+        p.pause()
+        p.seek(to: CMTime(seconds: t, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    /// 영상에서 지금 보고 있는 위치
+    var current: Double { player?.currentTime().seconds ?? 0 }
+
+    func setStartHere() {
+        let t = min(current, duration)
+        start = t
+        if end <= t || end - t > maxLength { end = min(duration, t + min(5, maxLength)) }
+        seek(t)
+    }
+
+    func setEndHere() {
+        let t = min(current, duration)
+        guard t > start else { status = "끝은 시작보다 뒤여야 해요"; return }
+        end = min(t, start + maxLength)
+        seek(end)
+    }
+
+    /// 고른 구간만 한 번 재생해 본다
+    func playRange() {
+        guard let p = player else { return }
+        stopRange()
+        p.seek(to: CMTime(seconds: start, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+            Task { @MainActor in
+                self.boundary = p.addBoundaryTimeObserver(forTimes: [NSValue(time: CMTime(seconds: self.end, preferredTimescale: 600))],
+                                                          queue: .main) { [weak self] in
+                    p.pause()
+                    Task { @MainActor in self?.stopRange() }
+                }
+                p.play()
+            }
+        }
+    }
+
+    private func stopRange() {
+        if let b = boundary { player?.removeTimeObserver(b); boundary = nil }
     }
 
     func cancel() { task?.cancel() }
 
     func make() {
         guard let url = source, duration > 0 else { return }
-        let from = max(0, min(start, duration)), to = min(duration, from + min(length, maxLength))
-        guard to > from else { return }
-        let fps = Double(self.fps), side = CGFloat(longSide), limit = Int(limitMB * 1_000_000)
+        let from = max(0, min(start, duration)), to = min(duration, end, from + maxLength)
+        guard to > from else { status = "구간을 골라 주세요"; return }
+        player?.pause()
+        let fps = Double(self.fps), side = CGFloat(longSide), limit = Int(limitMB * 1_000_000), fitOne = self.fitOne
         working = true; progress = 0; parts = []; status = "장면 뽑는 중…"
         task = Task.detached(priority: .userInitiated) {
             let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
@@ -3370,28 +3454,44 @@ final class GIFJob: ObservableObject {
                 return
             }
             await MainActor.run { self.status = "GIF 만드는 중…" }
-            let made = GIFEncoder.split(frames, delay: 1 / fps, limit: limit) { f in
-                Task { @MainActor in self.progress = 0.4 + 0.6 * f }
-            }
+            let report: (Double) -> Void = { f in Task { @MainActor in self.progress = 0.4 + 0.6 * f } }
             let sub = GIFJob.dir.appendingPathComponent(String(UUID().uuidString.prefix(8)))
             try? FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
             let base = url.deletingPathExtension().lastPathComponent
             var out: [Part] = []
-            for (i, p) in made.enumerated() {
-                let name = made.count == 1 ? "\(base).gif" : "\(base)_\(i + 1).gif"
-                let file = sub.appendingPathComponent(name)
-                guard (try? p.data.write(to: file)) != nil else { continue }
-                out.append(Part(url: file, bytes: p.data.count,
-                                from: from + Double(p.first) / fps, to: from + Double(p.first + p.count) / fps))
+            var message = ""
+            if fitOne {
+                if let r = GIFEncoder.fitOne(frames, fps: fps, limit: limit, progress: report) {
+                    let file = sub.appendingPathComponent("\(base).gif")
+                    if (try? r.data.write(to: file)) != nil {
+                        out.append(Part(url: file, bytes: r.data.count, from: from, to: to))
+                    }
+                    var changed: [String] = []
+                    if r.fps < fps - 0.01 { changed.append("초당 \(Int(r.fps.rounded()))장") }
+                    if r.scale < 0.999 { changed.append("긴 변 \(Int(Double(side) * r.scale))px") }
+                    message = changed.isEmpty ? "한 장으로 다 만들었어요"
+                        : "\(Int(self.limitMBValue(limit)))MB에 맞추려고 " + changed.joined(separator: " · ") + "로 줄였어요"
+                } else {
+                    message = "한 장에 맞추기엔 너무 길어요. 구간을 줄이거나 '여러 장으로 나누기'를 써 보세요"
+                }
+            } else {
+                let made = GIFEncoder.split(frames, delay: 1 / fps, limit: limit, progress: report)
+                for (i, p) in made.enumerated() {
+                    let name = made.count == 1 ? "\(base).gif" : "\(base)_\(i + 1).gif"
+                    let file = sub.appendingPathComponent(name)
+                    guard (try? p.data.write(to: file)) != nil else { continue }
+                    out.append(Part(url: file, bytes: p.data.count,
+                                    from: from + Double(p.first) / fps, to: from + Double(p.first + p.count) / fps))
+                }
+                message = out.count > 1 ? "\(Int(self.limitMBValue(limit)))MB를 넘지 않게 \(out.count)장으로 나눴어요" : "다 만들었어요"
             }
             await MainActor.run {
-                self.parts = out; self.working = false; self.progress = 1
-                self.status = out.count > 1
-                    ? "\(String(format: "%.0f", self.limitMB))MB를 넘지 않게 \(out.count)장으로 나눴어요"
-                    : "다 만들었어요"
+                self.parts = out; self.working = false; self.progress = 1; self.status = message
             }
         }
     }
+
+    nonisolated func limitMBValue(_ limit: Int) -> Double { Double(limit) / 1_000_000 }
 
     func saveToDownloads() {
         let dl = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
@@ -3427,6 +3527,21 @@ struct AnimatedImage: NSViewRepresentable {
     }
 }
 
+/// 영상 재생기(시작·끝을 보면서 고른다)
+struct VideoPlayer: NSViewRepresentable {
+    let player: AVPlayer
+    func makeNSView(context: Context) -> AVPlayerView {
+        let v = AVPlayerView()
+        v.controlsStyle = .inline
+        v.showsFrameSteppingButtons = true
+        v.player = player
+        return v
+    }
+    func updateNSView(_ v: AVPlayerView, context: Context) {
+        if v.player !== player { v.player = player }
+    }
+}
+
 struct GIFView: View {
     @ObservedObject var job: GIFJob
     @StateObject private var preview = GIFPreviewPick()
@@ -3434,23 +3549,48 @@ struct GIFView: View {
     func sec(_ v: Double) -> String { String(format: "%.1f초", v) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        ScrollView { content }
+            .frame(minWidth: 520, idealWidth: 520, minHeight: 500)
+    }
+
+    var content: some View {
+        VStack(alignment: .leading, spacing: 12) {
             if let src = job.source {
                 Label(src.lastPathComponent, systemImage: "film").font(.headline)
+                if let p = job.player {
+                    VideoPlayer(player: p)
+                        .frame(height: 260)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                // 재생기에서 원하는 장면을 찾은 뒤 '여기서 시작/끝'을 누르거나, 아래 막대로 직접 고른다
+                HStack {
+                    Button { job.setStartHere() } label: { Label("여기서 시작", systemImage: "arrow.right.to.line") }
+                    Button { job.setEndHere() } label: { Label("여기서 끝", systemImage: "arrow.left.to.line") }
+                    Spacer()
+                    Button { job.playRange() } label: { Label("구간 재생", systemImage: "play.fill") }
+                        .disabled(job.length <= 0)
+                }
+                .disabled(job.working || job.duration == 0)
+
                 Form {
-                    LabeledContent("영상 길이", value: job.duration > 0 ? sec(job.duration) : "읽는 중…")
                     LabeledContent("시작") {
                         HStack {
                             Slider(value: $job.start, in: 0...max(job.duration, 0.1))
                             Text(sec(job.start)).monospacedDigit().frame(width: 52, alignment: .trailing)
                         }
                     }
-                    LabeledContent("길이") {
+                    LabeledContent("끝") {
                         HStack {
-                            Slider(value: $job.length, in: 0.5...max(min(job.maxLength, job.duration), 0.6))
-                            Text(sec(min(job.length, max(0, job.duration - job.start))))
-                                .monospacedDigit().frame(width: 52, alignment: .trailing)
+                            Slider(value: $job.end, in: 0...max(job.duration, 0.1))
+                            Text(sec(job.end)).monospacedDigit().frame(width: 52, alignment: .trailing)
                         }
+                    }
+                    LabeledContent("구간 길이") {
+                        Text(job.length > job.maxLength
+                             ? "\(sec(job.length)) — 한 번에 \(Int(job.maxLength))초까지라 앞부분만 만들어요"
+                             : sec(job.length) + (job.duration > 0 ? " / 영상 \(sec(job.duration))" : ""))
+                            .foregroundStyle(job.length > job.maxLength ? Color.orange : Color.secondary)
+                            .monospacedDigit()
                     }
                     Picker("크기 (긴 변)", selection: $job.longSide) {
                         ForEach([320, 480, 640, 800], id: \.self) { Text("\($0)px").tag($0) }
@@ -3464,6 +3604,11 @@ struct GIFView: View {
                     Picker("한 장 최대 용량", selection: $job.limitMB) {
                         ForEach([5.0, 10.0, 15.0, 20.0], id: \.self) { Text("\(Int($0))MB").tag($0) }
                     }
+                    Picker("용량을 넘으면", selection: $job.fitOne) {
+                        Text("여러 장으로 나누기").tag(false)
+                        Text("한 장에 맞추기 (부드러움·크기를 줄임)").tag(true)
+                    }
+                    .pickerStyle(.radioGroup)
                 }
                 .formStyle(.grouped)
                 .disabled(job.working)
@@ -3473,11 +3618,11 @@ struct GIFView: View {
                         ProgressView(value: job.progress).frame(maxWidth: .infinity)
                         Button("멈추기") { job.cancel() }
                     } else {
-                        Text(job.status).foregroundStyle(.secondary)
+                        Text(job.status).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         Spacer()
                         Button("GIF 만들기") { job.make() }
                             .keyboardShortcut(.defaultAction)
-                            .disabled(job.duration == 0)
+                            .disabled(job.duration == 0 || job.length <= 0)
                     }
                 }
 
@@ -3485,7 +3630,7 @@ struct GIFView: View {
                     Divider()
                     let shown = job.parts.first { $0.id == preview.id } ?? job.parts[0]
                     AnimatedImage(url: shown.url)
-                        .frame(maxWidth: .infinity, minHeight: 160, maxHeight: 240)
+                        .frame(maxWidth: .infinity, minHeight: 140, maxHeight: 220)
                     Text("아래 GIF를 블로그로 바로 끌어다 넣을 수 있어요").font(.caption).foregroundStyle(.secondary)
                     ScrollView {
                         VStack(spacing: 4) {
@@ -3507,7 +3652,7 @@ struct GIFView: View {
                             }
                         }
                     }
-                    .frame(maxHeight: 180)
+                    .frame(maxHeight: 150)
                     HStack {
                         Spacer()
                         Button("다운로드 폴더에 저장") { job.saveToDownloads() }
@@ -3520,7 +3665,6 @@ struct GIFView: View {
             }
         }
         .padding(18)
-        .frame(width: 460)
     }
 }
 
@@ -3964,7 +4108,7 @@ struct PhotoMapApp: App {
         Window("GIF 만들기", id: "gif") {
             GIFView(job: GIFJob.shared)
         }
-        .windowResizability(.contentSize)
+        .defaultSize(width: 540, height: 860)
 
         Window("사진지도 도움말", id: "help") {
             HelpView()
