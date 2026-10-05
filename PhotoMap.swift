@@ -377,7 +377,7 @@ enum Scanner {
                 }
                 var p = Photo(path: f, lat: nil, lon: nil, date: date, source: nil, size: entry.size ?? size,
                               mtime: entry.mtime)
-                p.cam = model
+                p.cam = model.isEmpty && p.isVideo ? nil : model   // 동영상은 fillCameras에서 파일을 직접 읽는다
                 // 예전 캐시에는 수정 시각이 없다. 크기가 같으면 이미 계산한 중복 해시는 살려 둔다
                 if let old = previous[f], old.size == p.size, old.mtime == nil { p.hash = old.hash }
                 if let lat, let lon, !(lat == 0 && lon == 0) {
@@ -393,8 +393,46 @@ enum Scanner {
         return photos
     }
 
+    /// 동영상의 기종. Spotlight가 못 읽어서 영상 파일 안의 정보를 직접 본다
+    /// (아이폰: quicktime model, 갤럭시: auth "Samsung SM-F711N", 캐논: modl 데이터 "Canon EOS R6m2")
+    static func videoModel(_ path: String) -> String {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        var found = "", samsung = false
+        for fmt in asset.availableMetadataFormats {
+            for item in asset.metadata(forFormat: fmt) {
+                let id = item.identifier?.rawValue ?? ""
+                // 갤럭시 영상에만 있는 칸(모델 이름이 없는 옛 갤럭시 영상도 갤럭시로 알아본다)
+                if id == "uiso/SDLN" || id == "uiso/smrd" || id == "uiso/smta" { samsung = true }
+                guard id.hasSuffix("quicktime.model") || id == "uiso/modl" || id == "uiso/auth" || id == "udta/auth"
+                        || item.commonKey == .commonKeyModel else { continue }
+                var v = item.stringValue
+                if v == nil, let d = item.dataValue {
+                    // 앞의 몇 바이트(언어 코드 등)를 빼고 글자만 남긴다
+                    let text = String(decoding: d.filter { $0 >= 0x20 && $0 < 0x7f }, as: UTF8.self)
+                    v = text.range(of: "[A-Za-z].*", options: .regularExpression).map { String(text[$0]) }
+                }
+                guard var m = v?.trimmingCharacters(in: .whitespacesAndNewlines), !m.isEmpty else { continue }
+                if id.hasSuffix("auth") {
+                    if m.lowercased().hasPrefix("samsung ") { m = String(m.dropFirst(8)) }
+                    else if !m.hasPrefix("Galaxy") { continue }
+                }
+                if id.hasSuffix("quicktime.model") || id == "uiso/modl" { return m }
+                if found.isEmpty { found = m }
+            }
+        }
+        return found.isEmpty && samsung ? "Galaxy" : found
+    }
+
     /// 예전 캐시에는 기종이 없다. 처음 한 번만 Spotlight에서 기종만 따로 읽어 채운다
     static func fillCameras(_ photos: inout [Photo], progress: @escaping (Int, Int) -> Void) {
+        // 동영상은 Spotlight에 기종이 없어서 파일에서 직접 읽는다(예전에 빈칸으로 채운 것도 한 번 다시 읽는다)
+        let redoVideos = !prefs.bool(forKey: "videoCamRead")
+        let videos = photos.indices.filter { photos[$0].isVideo && (photos[$0].cam == nil || (redoVideos && photos[$0].cam == "")) }
+        for (n, i) in videos.enumerated() {
+            photos[i].cam = videoModel(photos[i].path)
+            if n % 20 == 0 { progress(n, videos.count) }
+        }
+        prefs.set(true, forKey: "videoCamRead")
         let todo = photos.indices.filter { photos[$0].cam == nil }
         let batchSize = 500
         for start in stride(from: 0, to: todo.count, by: batchSize) {
