@@ -739,7 +739,33 @@ final class Model: ObservableObject {
     @Published var duplicateCount = 0
     private var hits: [Photo] = []
 
+    /// 썸네일 우클릭 메뉴처럼 Model을 직접 받지 않는 곳에서 쓴다
+    static weak var current: Model?
+
+    /// 자동 보정본을 원본 옆에 새 파일로 저장한다(여러 장이면 동시에)
+    func saveEnhancedCopies(_ urls: [URL]) {
+        let list = urls.filter { Enhancer.imageExts.contains($0.pathExtension.lowercased()) }
+        guard !list.isEmpty else { notify("보정할 사진이 없어요 (동영상은 안 돼요)"); return }
+        notify("\(list.count)장 보정해서 저장하는 중…")
+        Task.detached {
+            var saved: [URL] = []
+            let q = DispatchQueue(label: "save.collect")
+            DispatchQueue.concurrentPerform(iterations: list.count) { i in
+                if let u = Enhancer.shared.saveCopy(list[i]) { q.sync { saved.append(u) } }
+            }
+            let done = saved
+            await MainActor.run {
+                if done.count == 1 { NSWorkspace.shared.activateFileViewerSelecting(done) }
+                self.notify(done.count == list.count
+                    ? "보정본 \(done.count)장을 원본 옆에 '_보정.jpg'로 저장했어요"
+                    : "보정본 \(done.count)장 저장 · \(list.count - done.count)장은 실패했어요")
+                self.rescan()
+            }
+        }
+    }
+
     init() {
+        defer { Model.current = self }
         if let data = try? Data(contentsOf: dogLabelsURL),
            let m = try? JSONDecoder().decode([String: Bool].self, from: data) {
             dogLabels = m
@@ -2221,6 +2247,10 @@ struct Thumb: View {
                 Button("Finder에서 보기") { NSWorkspace.shared.activateFileViewerSelecting([photo.url]) }
                 if photo.isVideo {
                     Button("GIF 만들기…") { GIFJob.shared.load(photo.url); openWindow(id: "gif") }
+                } else {
+                    Button("🪄 자동 보정해서 다른 파일로 저장" + (selectionCount > 1 ? " (선택 \(selectionCount)장)" : "")) {
+                        Model.current?.saveEnhancedCopies(dragURLs?() ?? [photo.url])
+                    }
                 }
                 if let onShowOnMap, photo.lat != nil {
                     Button("장소 탭에서 위치 보기", action: onShowOnMap)
@@ -2306,27 +2336,7 @@ final class Enhancer: @unchecked Sendable {
         let key = "\(url.path)|\(mtime)|\(Int(maxSide))"
         lock.lock(); let cached = made[key]; lock.unlock()
         if let c = cached, FileManager.default.fileExists(atPath: c.path) { return c }
-
-        var img: CIImage
-        if Self.rawExts.contains(ext) {
-            guard let f = CIRAWFilter(imageURL: url) else { return url }
-            let long = max(f.nativeSize.width, f.nativeSize.height)
-            if maxSide > 0, long > maxSide { f.scaleFactor = Float(maxSide / long) }
-            guard let o = f.outputImage else { return url }
-            img = o
-        } else {
-            guard let o = CIImage(contentsOf: url, options: [.applyOrientationProperty: true]) else { return url }
-            img = o
-            let long = max(img.extent.width, img.extent.height)
-            if maxSide > 0, long > maxSide {
-                let s = maxSide / long
-                img = img.applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: s, kCIInputAspectRatioKey: 1])
-            }
-        }
-        for f in img.autoAdjustmentFilters(options: [.redEye: false]) {
-            f.setValue(img, forKey: kCIInputImageKey)
-            if let o = f.outputImage { img = o }
-        }
+        guard let img = autoImage(url, maxSide: maxSide) else { return url }
         // 같은 이름 사진이 여러 폴더에 있어도 겹치지 않게 드래그마다 하위 폴더를 따로 쓴다(블로그엔 원래 파일 이름으로 올라간다)
         let sub = dir.appendingPathComponent(String(UUID().uuidString.prefix(8)))
         try? FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
@@ -2345,6 +2355,59 @@ final class Enhancer: @unchecked Sendable {
         guard CGImageDestinationFinalize(dest) else { return url }
         lock.lock(); made[key] = out; lock.unlock()
         return out
+    }
+
+    /// 원본을 읽어(필요하면 줄여서) 자동 보정을 건 이미지
+    private func autoImage(_ url: URL, maxSide: Double) -> CIImage? {
+        var img: CIImage
+        if Self.rawExts.contains(url.pathExtension.lowercased()) {
+            guard let f = CIRAWFilter(imageURL: url) else { return nil }
+            let long = max(f.nativeSize.width, f.nativeSize.height)
+            if maxSide > 0, long > maxSide { f.scaleFactor = Float(maxSide / long) }
+            guard let o = f.outputImage else { return nil }
+            img = o
+        } else {
+            guard let o = CIImage(contentsOf: url, options: [.applyOrientationProperty: true]) else { return nil }
+            img = o
+            let long = max(img.extent.width, img.extent.height)
+            if maxSide > 0, long > maxSide {
+                let s = maxSide / long
+                img = img.applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: s, kCIInputAspectRatioKey: 1])
+            }
+        }
+        for f in img.autoAdjustmentFilters(options: [.redEye: false]) {
+            f.setValue(img, forKey: kCIInputImageKey)
+            if let o = f.outputImage { img = o }
+        }
+        return img
+    }
+
+    /// 우클릭 '자동 보정해서 다른 파일로 저장': 원본 옆에 '이름_보정.jpg'로 저장한다(원본 크기).
+    /// 촬영 시각·GPS·카메라 정보는 그대로 옮겨서, 앱에서도 원본 바로 옆에 같은 날짜·장소로 보인다
+    func saveCopy(_ url: URL) -> URL? {
+        guard Self.imageExts.contains(url.pathExtension.lowercased()), let img = autoImage(url, maxSide: 0) else { return nil }
+        let folder = url.deletingLastPathComponent(), base = url.deletingPathExtension().lastPathComponent + "_보정"
+        var out = folder.appendingPathComponent(base + ".jpg")
+        var n = 2
+        while FileManager.default.fileExists(atPath: out.path) { out = folder.appendingPathComponent("\(base) \(n).jpg"); n += 1 }
+        var props: [CFString: Any] = [:]
+        if let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
+            for k in [kCGImagePropertyExifDictionary, kCGImagePropertyGPSDictionary, kCGImagePropertyIPTCDictionary,
+                      kCGImagePropertyDPIWidth, kCGImagePropertyDPIHeight] { if let v = p[k] { props[k] = v } }
+            if var tiff = p[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
+                tiff[kCGImagePropertyTIFFOrientation] = 1   // 회전은 이미 적용했다
+                props[kCGImagePropertyTIFFDictionary] = tiff
+            }
+        }
+        props[kCGImagePropertyOrientation] = 1
+        props[kCGImageDestinationLossyCompressionQuality] = 0.92
+        guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
+              let cg = ctx.createCGImage(img, from: img.extent, format: .RGBA8, colorSpace: cs),
+              let dest = CGImageDestinationCreateWithURL(out as CFURL, "public.jpeg" as CFString, 1, nil)
+        else { return nil }
+        CGImageDestinationAddImage(dest, cg, props as CFDictionary)
+        return CGImageDestinationFinalize(dest) ? out : nil
     }
 
     /// 여러 장이면 동시에 만든다
@@ -3995,6 +4058,7 @@ struct HelpView: View {
                 helpSection("드래그 자동 보정", """
                 🪄 아이콘(⇧⌘E)을 켜면 블로그·Finder로 끌어갈 때 밝기·대비·색을 자동으로 맞춘 JPG(크기는 원본 그대로)를 넘겨요.
                 원본은 그대로이고, 보정본은 임시 파일이라 앱을 끄면 지워져요. 크기는 설정 → 보기에서 바꿔요.
+                남겨 두고 싶으면 사진을 우클릭 → **자동 보정해서 다른 파일로 저장**: 원본 옆에 '이름_보정.jpg'로 저장돼요(촬영 정보·위치 그대로).
                 """)
                 helpSection("동영상 → GIF", """
                 동영상을 우클릭 → **GIF 만들기…** 시작·길이·크기·부드러움을 고르고 만들면,
