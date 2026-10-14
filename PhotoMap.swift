@@ -747,7 +747,7 @@ final class Model: ObservableObject {
         didSet { PhotoMap.enhanceStrength = enhanceStrength; prefs.set(enhanceStrength, forKey: "enhanceStrength") }
     }
 
-    func saveEnhancedCopies(_ urls: [URL], strength: Double? = nil) {
+    func saveEnhancedCopies(_ urls: [URL], strength: Double? = nil, done finished: (([URL]) -> Void)? = nil) {
         let strength = strength ?? enhanceStrength
         let list = urls.filter { Enhancer.imageExts.contains($0.pathExtension.lowercased()) }
         guard !list.isEmpty else { notify("보정할 사진이 없어요 (동영상은 안 돼요)"); return }
@@ -760,10 +760,10 @@ final class Model: ObservableObject {
             }
             let done = saved
             await MainActor.run {
-                if done.count == 1 { NSWorkspace.shared.activateFileViewerSelecting(done) }
                 self.notify(done.count == list.count
                     ? "보정본 \(done.count)장을 원본 옆에 '_보정.jpg'로 저장했어요"
                     : "보정본 \(done.count)장 저장 · \(list.count - done.count)장은 실패했어요")
+                finished?(done)
                 self.rescan()
             }
         }
@@ -2253,7 +2253,7 @@ struct Thumb: View {
                 if photo.isVideo {
                     Button("GIF 만들기…") { GIFJob.shared.load(photo.url); openWindow(id: "gif") }
                 } else {
-                    Button("🪄 보정 미리보기…") { EnhancePreview.shared.load(photo.url); openWindow(id: "enhance") }
+                    Button("🪄 보정 미리보기 · 저장…") { EnhancePreview.shared.load(photo.url); openWindow(id: "enhance") }
                     Button("🪄 자동 보정해서 다른 파일로 저장" + (selectionCount > 1 ? " (선택 \(selectionCount)장)" : "")) {
                         Model.current?.saveEnhancedCopies(dragURLs?() ?? [photo.url])
                     }
@@ -3774,6 +3774,9 @@ final class GIFPreviewPick: ObservableObject { @Published var id: UUID? }
 final class EnhancePreview: ObservableObject {
     static let shared = EnhancePreview()
     private let ctx = CIContext()
+    /// 방금 저장한 보정본(창 아래에 보여주고 Finder로 열 수 있게)
+    @Published var saved: [URL] = []
+    @Published var saving = false
 
     @Published var url: URL?
     @Published var strength: Double = enhanceStrength { didSet { if strength != oldValue { render() } } }
@@ -3786,7 +3789,7 @@ final class EnhancePreview: ObservableObject {
 
     func load(_ u: URL) {
         guard u != url, Enhancer.imageExts.contains(u.pathExtension.lowercased()) else { return }
-        url = u; loading = true; image = nil; original = nil
+        url = u; loading = true; image = nil; original = nil; saved = []
         strength = enhanceStrength
         Task.detached(priority: .userInitiated) {
             // 미리보기는 화면에 맞는 크기(긴 변 1600px)로 줄여 계산해서 슬라이더를 끌어도 바로 바뀐다
@@ -3827,6 +3830,14 @@ struct EnhanceView: View {
     @ObservedObject var preview: EnhancePreview
     @ObservedObject var model: Model
     @StateObject private var hold = HoldFlag()
+
+    /// 미리보는 사진이 목록에서 여러 장 고른 것 중 하나면 고른 사진 전부(동영상 빼고), 아니면 그 사진만
+    func saveTargets(_ u: URL) -> [URL] {
+        let sel = model.currentSelection
+        guard sel.count > 1, sel.contains(u.path) else { return [u] }
+        return sel.sorted().map { URL(fileURLWithPath: $0) }
+            .filter { Enhancer.imageExts.contains($0.pathExtension.lowercased()) }
+    }
 
     var pct: String { "\(Int((preview.strength * 100).rounded()))%" }
 
@@ -3870,12 +3881,35 @@ struct EnhanceView: View {
                         model.notify("보정 강도를 \(pct)로 정했어요 · 드래그 보정과 우클릭 저장에 써요")
                     }
                     .disabled(abs(model.enhanceStrength - preview.strength) < 0.001)
-                    Button("이 강도로 저장") { model.saveEnhancedCopies([u], strength: preview.strength) }
-                        .keyboardShortcut(.defaultAction)
+                    // 목록에서 여러 장을 골라 두었으면 고른 사진 전부를 이 강도로 저장한다
+                    let targets = saveTargets(u)
+                    Button(targets.count > 1 ? "고른 \(targets.count)장 다른 파일로 저장" : "다른 파일로 저장") {
+                        preview.saving = true
+                        model.saveEnhancedCopies(targets, strength: preview.strength) { urls in
+                            preview.saving = false
+                            preview.saved = urls
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(preview.saving || preview.loading)
                 }
-                Text("지금 기본 강도: \(Int((model.enhanceStrength * 100).rounded()))%")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+                HStack {
+                    if preview.saving {
+                        ProgressView().controlSize(.small)
+                        Text("저장하는 중…")
+                    } else if !preview.saved.isEmpty {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        Text(preview.saved.count == 1 ? "저장했어요: \(preview.saved[0].lastPathComponent)"
+                                                      : "\(preview.saved.count)장 저장했어요 (원본 옆 _보정.jpg)")
+                        Button("Finder에서 보기") { NSWorkspace.shared.activateFileViewerSelecting(preview.saved) }
+                            .controlSize(.small)
+                    }
+                    Spacer()
+                    Text("지금 기본 강도: \(Int((model.enhanceStrength * 100).rounded()))% · 원본 옆에 '이름_보정.jpg'로 저장 (⌘S)")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
             } else {
                 Text("사진을 우클릭 → 보정 미리보기…를 고르세요")
                     .foregroundStyle(.secondary)
@@ -4222,7 +4256,7 @@ struct HelpView: View {
                 helpSection("드래그 자동 보정", """
                 🪄 아이콘(⇧⌘E)을 켜면 블로그·Finder로 끌어갈 때 밝기·대비·색을 자동으로 맞춘 JPG(크기는 원본 그대로)를 넘겨요.
                 원본은 그대로이고, 보정본은 임시 파일이라 앱을 끄면 지워져요. 크기는 설정 → 보기에서 바꿔요.
-                우클릭 → **보정 미리보기…**에서 강도(0~150%)를 보면서 고르고 '이 강도를 기본으로' 정할 수 있어요.
+                우클릭 → **보정 미리보기 · 저장…**에서 강도(0~150%)를 보면서 고르고 바로 **다른 파일로 저장**(⌘S)하거나 '이 강도를 기본으로' 정할 수 있어요.
                 남겨 두고 싶으면 사진을 우클릭 → **자동 보정해서 다른 파일로 저장**: 원본 옆에 '이름_보정.jpg'로 저장돼요(촬영 정보·위치 그대로).
                 """)
                 helpSection("동영상 → GIF", """
