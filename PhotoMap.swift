@@ -743,7 +743,12 @@ final class Model: ObservableObject {
     static weak var current: Model?
 
     /// 자동 보정본을 원본 옆에 새 파일로 저장한다(여러 장이면 동시에)
-    func saveEnhancedCopies(_ urls: [URL]) {
+    @Published var enhanceStrength = PhotoMap.enhanceStrength {
+        didSet { PhotoMap.enhanceStrength = enhanceStrength; prefs.set(enhanceStrength, forKey: "enhanceStrength") }
+    }
+
+    func saveEnhancedCopies(_ urls: [URL], strength: Double? = nil) {
+        let strength = strength ?? enhanceStrength
         let list = urls.filter { Enhancer.imageExts.contains($0.pathExtension.lowercased()) }
         guard !list.isEmpty else { notify("보정할 사진이 없어요 (동영상은 안 돼요)"); return }
         notify("\(list.count)장 보정해서 저장하는 중…")
@@ -751,7 +756,7 @@ final class Model: ObservableObject {
             var saved: [URL] = []
             let q = DispatchQueue(label: "save.collect")
             DispatchQueue.concurrentPerform(iterations: list.count) { i in
-                if let u = Enhancer.shared.saveCopy(list[i]) { q.sync { saved.append(u) } }
+                if let u = Enhancer.shared.saveCopy(list[i], strength: strength) { q.sync { saved.append(u) } }
             }
             let done = saved
             await MainActor.run {
@@ -2248,6 +2253,7 @@ struct Thumb: View {
                 if photo.isVideo {
                     Button("GIF 만들기…") { GIFJob.shared.load(photo.url); openWindow(id: "gif") }
                 } else {
+                    Button("🪄 보정 미리보기…") { EnhancePreview.shared.load(photo.url); openWindow(id: "enhance") }
                     Button("🪄 자동 보정해서 다른 파일로 저장" + (selectionCount > 1 ? " (선택 \(selectionCount)장)" : "")) {
                         Model.current?.saveEnhancedCopies(dragURLs?() ?? [photo.url])
                     }
@@ -2333,7 +2339,7 @@ final class Enhancer: @unchecked Sendable {
         let ext = url.pathExtension.lowercased()
         guard Self.imageExts.contains(ext) else { return url }
         let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate?.timeIntervalSince1970 ?? 0
-        let key = "\(url.path)|\(mtime)|\(Int(maxSide))"
+        let key = "\(url.path)|\(mtime)|\(Int(maxSide))|\(enhanceStrength)"
         lock.lock(); let cached = made[key]; lock.unlock()
         if let c = cached, FileManager.default.fileExists(atPath: c.path) { return c }
         guard let img = autoImage(url, maxSide: maxSide) else { return url }
@@ -2357,10 +2363,16 @@ final class Enhancer: @unchecked Sendable {
         return out
     }
 
-    /// 원본을 읽어(필요하면 줄여서) 자동 보정을 건 이미지
-    private func autoImage(_ url: URL, maxSide: Double) -> CIImage? {
+    /// 원본을 읽어(필요하면 줄여서) 자동 보정을 건 이미지. strength 1 = macOS 자동 보정 그대로, 0 = 원본
+    private func autoImage(_ url: URL, maxSide: Double, strength: Double = enhanceStrength) -> CIImage? {
+        guard let src = Self.source(url, maxSide: maxSide) else { return nil }
+        return Self.blend(src, Self.adjusted(src), strength)
+    }
+
+    /// 원본 이미지(회전 적용, 필요하면 긴 변을 maxSide로 줄임)
+    static func source(_ url: URL, maxSide: Double) -> CIImage? {
         var img: CIImage
-        if Self.rawExts.contains(url.pathExtension.lowercased()) {
+        if rawExts.contains(url.pathExtension.lowercased()) {
             guard let f = CIRAWFilter(imageURL: url) else { return nil }
             let long = max(f.nativeSize.width, f.nativeSize.height)
             if maxSide > 0, long > maxSide { f.scaleFactor = Float(maxSide / long) }
@@ -2375,17 +2387,38 @@ final class Enhancer: @unchecked Sendable {
                 img = img.applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: s, kCIInputAspectRatioKey: 1])
             }
         }
-        for f in img.autoAdjustmentFilters(options: [.redEye: false]) {
+        return img
+    }
+
+    /// macOS 자동 보정을 건 이미지
+    static func adjusted(_ src: CIImage) -> CIImage {
+        var img = src
+        for f in src.autoAdjustmentFilters(options: [.redEye: false]) {
             f.setValue(img, forKey: kCIInputImageKey)
             if let o = f.outputImage { img = o }
         }
         return img
     }
 
+    /// 원본과 보정본을 강도만큼 섞는다(1보다 크면 보정 방향으로 더 민다): 원본 + 강도 × (보정 − 원본)
+    static func blend(_ src: CIImage, _ adj: CIImage, _ s: Double) -> CIImage {
+        if abs(s - 1) < 0.001 { return adj }
+        if s < 0.001 { return src }
+        func scaled(_ i: CIImage, _ k: Double, alpha: Double) -> CIImage {
+            i.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: k, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 0, y: k, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: k, w: 0), "inputAVector": CIVector(x: 0, y: 0, z: 0, w: alpha)])
+        }
+        let sum = scaled(adj, s, alpha: 1).applyingFilter("CIAdditionCompositing",
+                                                          parameters: [kCIInputBackgroundImageKey: scaled(src, 1 - s, alpha: 0)])
+        return sum.applyingFilter("CIColorClamp").cropped(to: src.extent)
+    }
+
     /// 우클릭 '자동 보정해서 다른 파일로 저장': 원본 옆에 '이름_보정.jpg'로 저장한다(원본 크기).
     /// 촬영 시각·GPS·카메라 정보는 그대로 옮겨서, 앱에서도 원본 바로 옆에 같은 날짜·장소로 보인다
-    func saveCopy(_ url: URL) -> URL? {
-        guard Self.imageExts.contains(url.pathExtension.lowercased()), let img = autoImage(url, maxSide: 0) else { return nil }
+    func saveCopy(_ url: URL, strength: Double = enhanceStrength) -> URL? {
+        guard Self.imageExts.contains(url.pathExtension.lowercased()),
+              let img = autoImage(url, maxSide: 0, strength: strength) else { return nil }
         let folder = url.deletingLastPathComponent(), base = url.deletingPathExtension().lastPathComponent + "_보정"
         var out = folder.appendingPathComponent(base + ".jpg")
         var n = 2
@@ -2424,7 +2457,9 @@ final class Enhancer: @unchecked Sendable {
 
 /// 드래그 시 자동 보정 설정(드래그하는 AppKit 뷰에서 바로 읽는다)
 var enhanceOnDrag: Bool = pref("enhanceOnDrag", false)
-var enhanceMaxSide: Double = pref("enhanceMaxSide", 0.0)   // 0 = 원본 크기 그대로
+var enhanceMaxSide: Double = pref("enhanceMaxSide", 0.0)
+/// 보정 강도(1 = macOS 자동 보정 그대로). 보정 미리보기 창에서 정한다
+var enhanceStrength: Double = pref("enhanceStrength", 1.0)   // 0 = 원본 크기 그대로
 
 /// 썸네일 위에 깔리는 투명한 AppKit 뷰: 클릭은 onClick으로, 끌면 선택한 파일 전체를 Finder·브라우저로 끌어간다
 struct DragClickSource: NSViewRepresentable {
@@ -3733,6 +3768,129 @@ struct GIFView: View {
 
 final class GIFPreviewPick: ObservableObject { @Published var id: UUID? }
 
+// MARK: - 보정 미리보기 창 (강도를 보면서 고른다)
+
+@MainActor
+final class EnhancePreview: ObservableObject {
+    static let shared = EnhancePreview()
+    private let ctx = CIContext()
+
+    @Published var url: URL?
+    @Published var strength: Double = enhanceStrength { didSet { if strength != oldValue { render() } } }
+    @Published var image: NSImage?
+    @Published var original: NSImage?
+    @Published var loading = false
+    private var src: CIImage?
+    private var adj: CIImage?
+    private var renderTask: Task<Void, Never>?
+
+    func load(_ u: URL) {
+        guard u != url, Enhancer.imageExts.contains(u.pathExtension.lowercased()) else { return }
+        url = u; loading = true; image = nil; original = nil
+        strength = enhanceStrength
+        Task.detached(priority: .userInitiated) {
+            // 미리보기는 화면에 맞는 크기(긴 변 1600px)로 줄여 계산해서 슬라이더를 끌어도 바로 바뀐다
+            let s = Enhancer.source(u, maxSide: 1600)
+            let a = s.map(Enhancer.adjusted)
+            let orig = s.flatMap { Self.nsImage($0) }
+            await MainActor.run {
+                guard self.url == u else { return }
+                self.src = s; self.adj = a; self.original = orig; self.loading = false
+                self.render()
+            }
+        }
+    }
+
+    nonisolated static func nsImage(_ img: CIImage) -> NSImage? {
+        let ctx = CIContext()
+        guard let cg = ctx.createCGImage(img, from: img.extent, format: .RGBA8,
+                                         colorSpace: CGColorSpace(name: CGColorSpace.sRGB)) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
+    private func render() {
+        guard let s = src, let a = adj else { return }
+        let k = strength
+        renderTask?.cancel()
+        renderTask = Task.detached(priority: .userInitiated) {
+            let out = Self.nsImage(Enhancer.blend(s, a, k))
+            await MainActor.run {
+                if !Task.isCancelled, self.strength == k { self.image = out }
+            }
+        }
+    }
+}
+
+final class HoldFlag: ObservableObject { @Published var on = false }
+
+struct EnhanceView: View {
+    @ObservedObject var preview: EnhancePreview
+    @ObservedObject var model: Model
+    @StateObject private var hold = HoldFlag()
+
+    var pct: String { "\(Int((preview.strength * 100).rounded()))%" }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            if let u = preview.url {
+                HStack {
+                    Label(u.lastPathComponent, systemImage: "photo").font(.headline)
+                    Spacer()
+                    Text(hold.on ? "원본" : "보정 \(pct)")
+                        .font(.callout.weight(.medium))
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(hold.on ? Color.gray.opacity(0.25) : Color.accentColor.opacity(0.18), in: Capsule())
+                }
+                ZStack {
+                    Color.black.opacity(0.85)
+                    if let img = (hold.on ? preview.original : preview.image) ?? preview.original {
+                        Image(nsImage: img).resizable().scaledToFit()
+                    }
+                    if preview.loading { ProgressView() }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                // 누르고 있는 동안 원본을 보여준다(사진 앱의 M 키처럼)
+                .gesture(DragGesture(minimumDistance: 0)
+                    .onChanged { _ in hold.on = true }
+                    .onEnded { _ in hold.on = false })
+                .help("누르고 있으면 원본을 보여줘요")
+
+                HStack(spacing: 10) {
+                    Text("강도")
+                    Slider(value: $preview.strength, in: 0...1.5, step: 0.05)
+                    Text(pct).monospacedDigit().frame(width: 44, alignment: .trailing)
+                    Button("100%") { preview.strength = 1 }.controlSize(.small)
+                }
+                HStack {
+                    Text("사진을 누르고 있으면 원본 · 목록에서 다른 사진을 고르면 바뀌어요")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("이 강도를 기본으로") {
+                        model.enhanceStrength = preview.strength
+                        model.notify("보정 강도를 \(pct)로 정했어요 · 드래그 보정과 우클릭 저장에 써요")
+                    }
+                    .disabled(abs(model.enhanceStrength - preview.strength) < 0.001)
+                    Button("이 강도로 저장") { model.saveEnhancedCopies([u], strength: preview.strength) }
+                        .keyboardShortcut(.defaultAction)
+                }
+                Text("지금 기본 강도: \(Int((model.enhanceStrength * 100).rounded()))%")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            } else {
+                Text("사진을 우클릭 → 보정 미리보기…를 고르세요")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 520, minHeight: 420)
+        // 창을 열어 둔 채 목록에서 다른 사진을 고르면 따라간다
+        .onChange(of: model.infoPhoto?.path) { _, p in
+            if let p, let photo = model.infoPhoto, !photo.isVideo { preview.load(URL(fileURLWithPath: p)) }
+        }
+    }
+}
+
 // MARK: - 설정 창 (⌘,)
 
 struct SettingsView: View {
@@ -3793,6 +3951,12 @@ struct SettingsView: View {
                         Text("긴 변 1600px").tag(1600.0)
                     }
                     .disabled(!model.enhanceOnDrag)
+                    LabeledContent("보정 강도") {
+                        HStack {
+                            Slider(value: $model.enhanceStrength, in: 0...1.5, step: 0.05).frame(width: 180)
+                            Text("\(Int((model.enhanceStrength * 100).rounded()))%").monospacedDigit().frame(width: 44, alignment: .trailing)
+                        }
+                    }
                 } header: { Text("드래그 보정") } footer: {
                     Text("블로그·Finder로 끌어갈 때 밝기·대비·색을 자동으로 맞춘 JPG를 넘겨요. RAW(CR3)도 JPG로 바뀌어요. 원본은 바꾸지 않고, 보정본은 임시 파일이라 앱을 끄면 지워져요. 위치(GPS) 정보는 빠져요.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -4058,6 +4222,7 @@ struct HelpView: View {
                 helpSection("드래그 자동 보정", """
                 🪄 아이콘(⇧⌘E)을 켜면 블로그·Finder로 끌어갈 때 밝기·대비·색을 자동으로 맞춘 JPG(크기는 원본 그대로)를 넘겨요.
                 원본은 그대로이고, 보정본은 임시 파일이라 앱을 끄면 지워져요. 크기는 설정 → 보기에서 바꿔요.
+                우클릭 → **보정 미리보기…**에서 강도(0~150%)를 보면서 고르고 '이 강도를 기본으로' 정할 수 있어요.
                 남겨 두고 싶으면 사진을 우클릭 → **자동 보정해서 다른 파일로 저장**: 원본 옆에 '이름_보정.jpg'로 저장돼요(촬영 정보·위치 그대로).
                 """)
                 helpSection("동영상 → GIF", """
@@ -4162,6 +4327,11 @@ struct PhotoMapApp: App {
             }
             CommandMenu("작업") { WorkMenuItems(model: model, shortcuts: true) }
         }
+
+        Window("보정 미리보기", id: "enhance") {
+            EnhanceView(preview: EnhancePreview.shared, model: model)
+        }
+        .defaultSize(width: 760, height: 680)
 
         Window("사진 정보", id: "info") {
             InfoView(model: model)
