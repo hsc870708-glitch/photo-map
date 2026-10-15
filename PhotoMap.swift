@@ -693,7 +693,9 @@ final class Model: ObservableObject {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    private var all: [Photo] = [] { didSet { refreshCameras() } }
+    // 주의: 여기에 didSet을 달면 안 된다. 분석·중복 검사가 사진을 한 장씩 고칠 때마다 불려서
+    // 8만 장 × 수천 번이 되어 화면이 멈췄다(기종 수는 resolve()에서 한 번만 센다)
+    private var all: [Photo] = []
 
     /// 기종 필터. ""이면 모든 기종, noCamera면 기종 정보 없는 사진만
     static let noCamera = "기종 정보 없음"
@@ -1058,6 +1060,7 @@ final class Model: ObservableObject {
 
     /// GPS → 직접 지정 → 시간 추정 순서로 각 사진의 위치를 정한다
     func resolve() {
+        refreshCameras()
         let refs: [(t: Double, lat: Double, lon: Double, path: String)] = all.compactMap { p in
             guard p.source == .gps, !p.dateFixed, let d = p.date, let lat = p.lat, let lon = p.lon else { return nil }
             return (d.timeIntervalSince1970, lat, lon, p.path)
