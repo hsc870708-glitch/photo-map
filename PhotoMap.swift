@@ -598,8 +598,8 @@ final class Model: ObservableObject {
     @Published var estimateMinutes: Int = pref("estimateMinutes", 30) {
         didSet { prefs.set(estimateMinutes, forKey: "estimateMinutes"); resolve() }
     }
-    /// 추정 사진이 어느 GPS 사진의 위치를 빌렸는지(정보 창에 보여준다): 경로 → (기준 사진 경로, 시간 차 초)
-    private(set) var estimateRef: [String: (path: String, dt: Double)] = [:]
+    /// 추정 사진이 어느 사진(GPS 또는 직접 지정)의 위치를 빌렸는지(정보 창에 보여준다): 경로 → (기준 사진 경로, 시간 차 초, 지정 사진인지)
+    private(set) var estimateRef: [String: (path: String, dt: Double, manual: Bool)] = [:]
     /// 지도 탭에서 '추정' 사진만 보기
     @Published var estimatedOnly = false { didSet { recompute(); schedulePins() } }
     /// 사본이 있는 사진만 보기
@@ -1061,24 +1061,6 @@ final class Model: ObservableObject {
     /// GPS → 직접 지정 → 시간 추정 순서로 각 사진의 위치를 정한다
     func resolve() {
         refreshCameras()
-        let refs: [(t: Double, lat: Double, lon: Double, path: String)] = all.compactMap { p in
-            guard p.source == .gps, !p.dateFixed, let d = p.date, let lat = p.lat, let lon = p.lon else { return nil }
-            return (d.timeIntervalSince1970, lat, lon, p.path)
-        }.sorted { $0.t < $1.t }
-        let window = Double(estimateMinutes) * 60
-        var refOf: [String: (path: String, dt: Double)] = [:]
-
-        func nearest(_ t: Double) -> (t: Double, lat: Double, lon: Double, path: String)? {
-            guard !refs.isEmpty else { return nil }
-            var lo = 0, hi = refs.count
-            while lo < hi {
-                let mid = (lo + hi) / 2
-                if refs[mid].t < t { lo = mid + 1 } else { hi = mid }
-            }
-            let cands = [lo - 1, lo].filter { $0 >= 0 && $0 < refs.count }.map { refs[$0] }
-            return cands.min { abs($0.t - t) < abs($1.t - t) }
-        }
-
         byPath = Dictionary(all.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
         // 파일 내용(해시)과 크기가 똑같아야 같은 파일의 사본으로 본다(이름이 달라도).
         // 크기·촬영 시각만 같은 연사 사진은 내용이 달라서 중복이 아니다
@@ -1120,6 +1102,36 @@ final class Model: ObservableObject {
         var bySecond: [Int: [Double]] = [:]
         for (k, v) in manual { if let t = manualSecond(k) { bySecond[t] = v } }
 
+        // 시간 추정의 기준: GPS 사진 + 직접 위치를 지정한 사진.
+        // 휴대폰 GPS가 끊긴 구간도 카메라 사진 한 장만 지정하면 앞뒤 사진이 그 위치로 추정된다
+        func manualLoc(_ p: Photo) -> [Double]? {
+            guard let m = manual[manualKey(p)] ?? p.date.flatMap({ bySecond[Int($0.timeIntervalSince1970)] }),
+                  m.count == 2 else { return nil }
+            return m
+        }
+        typealias Ref = (t: Double, lat: Double, lon: Double, path: String, manual: Bool)
+        let refs: [Ref] = all.compactMap { p in
+            guard !p.dateFixed, let d = p.date else { return nil }
+            if p.source == .gps, let lat = p.lat, let lon = p.lon {
+                return (d.timeIntervalSince1970, lat, lon, p.path, false)
+            }
+            if let m = manualLoc(p) { return (d.timeIntervalSince1970, m[0], m[1], p.path, true) }
+            return nil
+        }.sorted { $0.t < $1.t }
+        let window = Double(estimateMinutes) * 60
+        var refOf: [String: (path: String, dt: Double, manual: Bool)] = [:]
+
+        func nearest(_ t: Double) -> Ref? {
+            guard !refs.isEmpty else { return nil }
+            var lo = 0, hi = refs.count
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if refs[mid].t < t { lo = mid + 1 } else { hi = mid }
+            }
+            let cands = [lo - 1, lo].filter { $0 >= 0 && $0 < refs.count }.map { refs[$0] }
+            return cands.min { abs($0.t - t) < abs($1.t - t) }
+        }
+
         // CR3는 분석하지 않고 같은 폴더·같은 이름의 JPG 결과를 쓴다
         var pairContent: [String: Bool] = [:]
         for p in all where !p.isRaw {
@@ -1139,15 +1151,14 @@ final class Model: ObservableObject {
             if !dogLabels.isEmpty, let l = dogLabels[manualKey(p)] { p.dog = l }
             if p.source == .gps {
                 nGPS += 1
-            } else if let m = manual[manualKey(p)] ?? p.date.flatMap({ bySecond[Int($0.timeIntervalSince1970)] }),
-                      m.count == 2 {
+            } else if let m = manualLoc(p) {
                 mPaths.insert(p.path)
                 p.lat = m[0]; p.lon = m[1]; p.source = .manual
                 nManual += 1
             } else if useEstimate, !p.dateFixed, let d = p.date, let n = nearest(d.timeIntervalSince1970),
                       abs(n.t - d.timeIntervalSince1970) <= window {
                 p.lat = n.lat; p.lon = n.lon; p.source = .estimated
-                refOf[p.path] = (n.path, d.timeIntervalSince1970 - n.t)
+                refOf[p.path] = (n.path, d.timeIntervalSince1970 - n.t, n.manual)
                 nEst += 1
             } else {
                 unloc.append(p)
@@ -3951,7 +3962,7 @@ struct SettingsView: View {
                         }
                     }
                     .disabled(!model.useEstimate)
-                    Text("이 시간 안에 찍힌 GPS 사진이 있으면 그 위치를 빌려 써요. 넓힐수록 많이 채워지지만 틀릴 가능성도 커져요.")
+                    Text("이 시간 안에 찍힌 GPS 사진(또는 위치를 지정한 사진)이 있으면 그 위치를 빌려 써요. 넓힐수록 많이 채워지지만 틀릴 가능성도 커져요.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("촬영 날짜") {
@@ -4184,7 +4195,7 @@ struct InfoView: View {
                 if p.source == .estimated, let ref = model.estimateRef[p.path] {
                     let min = Int((abs(ref.dt) / 60).rounded())
                     LabeledContent("추정 근거") {
-                        Text("\((ref.path as NSString).lastPathComponent) · \(min == 0 ? "1분 안쪽" : "\(min)분") \(ref.dt >= 0 ? "전에" : "뒤에") 찍힌 GPS 사진")
+                        Text("\((ref.path as NSString).lastPathComponent) · \(min == 0 ? "1분 안쪽" : "\(min)분") \(ref.dt >= 0 ? "전에" : "뒤에") 찍힌 \(ref.manual ? "위치 지정한" : "GPS") 사진")
                             .multilineTextAlignment(.trailing)
                     }
                 }
@@ -4245,7 +4256,7 @@ struct HelpView: View {
                 마우스를 올리면 설명이 나오고, 켜진 아이콘은 파랗게 채워져요.
                 """)
                 helpSection("위치 정하기", """
-                **추정** — GPS 없는 사진은 앞뒤 30분(설정에서 변경) 안의 GPS 사진 위치를 빌려 써요.
+                **추정** — GPS 없는 사진은 앞뒤 30분(설정에서 변경) 안의 GPS 사진 위치를 빌려 써요. 위치를 **지정**한 사진도 기준이 돼서, GPS가 끊긴 구간은 한 장만 지정하면 앞뒤 사진이 따라와요.
                 **지정** — 사진을 고르고 장소를 검색해 원을 옮긴 뒤, 아래 작업 막대의 **위치 → 원 위치로 지정**.
                 추정이 맞으면 **추정 위치 맞음 · 확정**. 사진 파일은 바뀌지 않고 앱 안에만 저장돼요.
                 """)
