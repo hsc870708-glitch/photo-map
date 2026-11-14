@@ -104,6 +104,8 @@ struct Photo: Codable, Identifiable, Hashable {
     var dog: Bool? = nil
     /// 촬영 기종(EXIF 모델 이름). nil이면 아직 안 읽음, ""이면 정보 없음
     var cam: String? = nil
+    /// 외장 디스크를 빼 둬서 지금 읽을 수 없는 사진(저장하지 않음). 정보는 그대로 두고 지도에 계속 보여준다
+    var offline = false
 
     // 화면에서 자주 쓰는 값을 한 번만 계산해 둔다(저장하지 않음, prepare()에서 채움).
     // 필터를 바꿀 때마다 6만 장의 경로 문자열을 다시 자르고 날짜를 다시 포맷하면 수백 ms씩 걸렸다
@@ -234,6 +236,11 @@ enum Scanner {
 
     struct FileEntry { let path: String; let size: Int64?; let mtime: Double? }
 
+    /// 연결이 안 된 외장 디스크 안의 사진 폴더(/Volumes/… 인데 지금 없는 폴더)
+    static func offlineRoots() -> [String] {
+        photoRoots.map(\.path).filter { $0.hasPrefix("/Volumes/") && !FileManager.default.fileExists(atPath: $0) }
+    }
+
     static func listFiles() -> [FileEntry] {
         var out: [FileEntry] = []
         let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
@@ -286,6 +293,34 @@ enum Scanner {
         return (date, lat, lon, model)
     }
 
+    /// Spotlight 색인이 없는 디스크의 동영상: 파일 안의 촬영 시각과 위치(ISO 6709 "+35.8744+128.7264/")를 직접 읽는다
+    static func videoInfo(_ path: String) -> (date: Date?, lat: Double?, lon: Double?) {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        let date = asset.creationDate?.dateValue
+        for fmt in asset.availableMetadataFormats {
+            for item in asset.metadata(forFormat: fmt) {
+                let id = item.identifier?.rawValue ?? ""
+                guard id.contains("ISO6709") || id.hasSuffix("xyz") || item.commonKey == .commonKeyLocation else { continue }
+                // 아이폰은 글자로, 갤럭시는 앞에 몇 바이트가 붙은 데이터로 들어 있다
+                let text = item.stringValue
+                    ?? item.dataValue.map { String(decoding: $0.filter { $0 >= 0x20 && $0 < 0x7f }, as: UTF8.self) } ?? ""
+                guard let r = text.range(of: "[+-][0-9]+\\.[0-9]+[+-][0-9]+\\.[0-9]+", options: .regularExpression)
+                else { continue }
+                let s = String(text[r])
+                guard let cut = s.dropFirst().firstIndex(where: { $0 == "+" || $0 == "-" }),
+                      let lat = Double(s[..<cut]), let lon = Double(s[cut...]), !(lat == 0 && lon == 0) else { continue }
+                return (date, lat, lon)
+            }
+        }
+        return (date, nil, nil)
+    }
+
+    /// 색인이 없는 디스크(NTFS·exFAT 외장 하드 등)에서 Spotlight는 날짜를 비우거나 1970-01-01로 준다
+    static func plausibleDate(_ d: Date?) -> Date? {
+        guard let d, d.timeIntervalSince1970 > 86_400 * 366 else { return nil }
+        return d
+    }
+
     /// 파일들의 (기종, 날짜, 크기, 위도, 경도) 문자열. 속성은 이름순으로 \0 구분되어 나온다
     static func mdls(_ files: [String]) -> [String] {
         let raw = String(decoding: run("/usr/bin/mdls", ["-raw", "-nullMarker", "",
@@ -311,7 +346,7 @@ enum Scanner {
     static func hashCandidates(_ photos: inout [Photo], previous: [String: Photo],
                                progress: @escaping (Int, Int) -> Void) {
         var groups: [String: [Int]] = [:]
-        for (i, p) in photos.enumerated() {
+        for (i, p) in photos.enumerated() where !p.offline {
             guard let size = p.size, size > 0 else { continue }
             let k = p.date.map { "\(Int($0.timeIntervalSince1970))|\(size)" } ?? "n|\(size)"
             groups[k, default: []].append(i)
@@ -336,9 +371,21 @@ enum Scanner {
         let entries = listFiles()
         var photos: [Photo] = []
         photos.reserveCapacity(entries.count)
+        // 빼 둔 외장 디스크의 사진은 지우지 않고 이전 정보를 그대로 둔다(다시 꽂으면 바로 이어서 쓴다)
+        let offline = offlineRoots().map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+        if !offline.isEmpty {
+            for old in previous.values where offline.contains(where: { old.path.hasPrefix($0) }) {
+                var o = old
+                o.offline = true
+                photos.append(o)
+            }
+        }
         var changed: [FileEntry] = []
         for e in entries {
-            if let old = previous[e.path], old.size == e.size, let m = old.mtime, m == e.mtime {
+            // 예전 버전이 외장 디스크에서 1970년으로 읽어 둔 사진은 다시 읽는다
+            if var old = previous[e.path], old.size == e.size, let m = old.mtime, m == e.mtime,
+               old.date == nil || plausibleDate(old.date) != nil {
+                old.offline = false
                 photos.append(old)
             } else {
                 changed.append(e)
@@ -349,6 +396,8 @@ enum Scanner {
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
 
+        struct Raw { var model = ""; var date: Date?; var size: Int64?; var lat: Double?; var lon: Double?; var direct = false }
+        var raws = [Raw](repeating: Raw(), count: files.count)
         let batchSize = 300
         for start in stride(from: 0, to: files.count, by: batchSize) {
             let batch = Array(files[start..<min(start + batchSize, files.count)])
@@ -361,34 +410,57 @@ enum Scanner {
                     return one.count == n ? one : Array(repeating: "", count: n)
                 }
             }
-            for (i, f) in batch.enumerated() {
-                let entry = changed[start + i]
-                var model = fields[n * i].trimmingCharacters(in: .whitespacesAndNewlines)
-                var date = fmt.date(from: fields[n * i + 1])
-                var size = Int64(fields[n * i + 2])
-                var lat = Double(fields[n * i + 3]), lon = Double(fields[n * i + 4])
-                if fields[n * i + 1].isEmpty && fields[n * i + 2].isEmpty {
-                    // Spotlight가 모르는 파일
-                    size = (try? FileManager.default.attributesOfItem(atPath: f)[.size] as? NSNumber)?.int64Value
-                    let ext = (f as NSString).pathExtension.lowercased()
-                    if ext != "mp4" && ext != "mov" {
-                        let e = readEXIF(f)
-                        date = e.date; lat = e.lat; lon = e.lon; model = e.model ?? ""
-                    }
-                }
-                var p = Photo(path: f, lat: nil, lon: nil, date: date, source: nil, size: entry.size ?? size,
-                              mtime: entry.mtime)
-                p.cam = model.isEmpty && p.isVideo ? nil : model   // 동영상은 fillCameras에서 파일을 직접 읽는다
-                // 예전 캐시에는 수정 시각이 없다. 크기가 같으면 이미 계산한 중복 해시는 살려 둔다
-                if let old = previous[f], old.size == p.size, old.mtime == nil { p.hash = old.hash }
-                if let lat, let lon, !(lat == 0 && lon == 0) {
-                    p.lat = lat
-                    p.lon = lon
-                    p.source = .gps
-                }
-                photos.append(p)
+            for i in batch.indices {
+                let lat = Double(fields[n * i + 3]), lon = Double(fields[n * i + 4])
+                let date = plausibleDate(fmt.date(from: fields[n * i + 1]))
+                // 날짜도 위치도 못 받았으면 Spotlight가 모르는 파일(색인 없는 외장 디스크 등) → 아래에서 파일을 직접 읽는다
+                raws[start + i] = Raw(model: fields[n * i].trimmingCharacters(in: .whitespacesAndNewlines),
+                                      date: date, size: Int64(fields[n * i + 2]), lat: lat, lon: lon,
+                                      direct: date == nil && lat == nil)
             }
             progress(min(start + batchSize, files.count), files.count)
+        }
+
+        // 파일을 직접 여는 건 느려서(외장 하드 수만 장) 여러 개를 동시에 읽는다
+        let direct = raws.indices.filter { raws[$0].direct }
+        if !direct.isEmpty {
+            let lock = NSLock()
+            var done = 0
+            raws.withUnsafeMutableBufferPointer { buf in
+                DispatchQueue.concurrentPerform(iterations: direct.count) { k in
+                    let i = direct[k], f = files[i]
+                    var r = buf[i]
+                    if r.size == nil {
+                        r.size = (try? FileManager.default.attributesOfItem(atPath: f)[.size] as? NSNumber)?.int64Value
+                    }
+                    if ["mp4", "mov"].contains((f as NSString).pathExtension.lowercased()) {
+                        let v = videoInfo(f)
+                        r.date = plausibleDate(v.date); r.lat = v.lat; r.lon = v.lon
+                    } else {
+                        let e = readEXIF(f)
+                        r.date = e.date; r.lat = e.lat; r.lon = e.lon
+                        if r.model.isEmpty { r.model = e.model ?? "" }
+                    }
+                    buf[i] = r
+                    lock.lock(); done += 1; let d = done; lock.unlock()
+                    if d % 100 == 0 { progress(d, direct.count) }
+                }
+            }
+        }
+
+        for (i, f) in files.enumerated() {
+            let entry = changed[i], r = raws[i]
+            var p = Photo(path: f, lat: nil, lon: nil, date: r.date, source: nil, size: entry.size ?? r.size,
+                          mtime: entry.mtime)
+            p.cam = r.model.isEmpty && p.isVideo ? nil : r.model   // 동영상은 fillCameras에서 파일을 직접 읽는다
+            // 예전 캐시에는 수정 시각이 없다. 크기가 같으면 이미 계산한 중복 해시는 살려 둔다
+            if let old = previous[f], old.size == p.size, old.mtime == nil { p.hash = old.hash }
+            if let lat = r.lat, let lon = r.lon, !(lat == 0 && lon == 0) {
+                p.lat = lat
+                p.lon = lon
+                p.source = .gps
+            }
+            photos.append(p)
         }
         fillCameras(&photos, progress: progress)
         return photos
@@ -428,13 +500,13 @@ enum Scanner {
     static func fillCameras(_ photos: inout [Photo], progress: @escaping (Int, Int) -> Void) {
         // 동영상은 Spotlight에 기종이 없어서 파일에서 직접 읽는다(예전에 빈칸으로 채운 것도 한 번 다시 읽는다)
         let redoVideos = !prefs.bool(forKey: "videoCamRead")
-        let videos = photos.indices.filter { photos[$0].isVideo && (photos[$0].cam == nil || (redoVideos && photos[$0].cam == "")) }
+        let videos = photos.indices.filter { !photos[$0].offline && photos[$0].isVideo && (photos[$0].cam == nil || (redoVideos && photos[$0].cam == "")) }
         for (n, i) in videos.enumerated() {
             photos[i].cam = videoModel(photos[i].path)
             if n % 20 == 0 { progress(n, videos.count) }
         }
         prefs.set(true, forKey: "videoCamRead")
-        let todo = photos.indices.filter { photos[$0].cam == nil }
+        let todo = photos.indices.filter { photos[$0].cam == nil && !photos[$0].offline }
         let batchSize = 500
         for start in stride(from: 0, to: todo.count, by: batchSize) {
             let idx = Array(todo[start..<min(start + batchSize, todo.count)])
@@ -788,6 +860,19 @@ final class Model: ObservableObject {
         }
         if let c = center { flyTo = (c, UUID()) }
         rescan()
+        // 사진 폴더가 있는 외장 디스크를 꽂거나 빼면 다시 읽는다(뺀 디스크의 사진은 '연결 안 됨'으로 남는다)
+        let nc = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
+            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let vol = (note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL)?.path else { return }
+                MainActor.assumeIsolated {
+                    guard let self, self.roots.contains(where: { $0.path == vol || $0.path.hasPrefix(vol + "/") }) else { return }
+                    self.notify(name == NSWorkspace.didMountNotification ? "외장 디스크가 연결됐어요 · 사진을 다시 읽어요"
+                                                                         : "외장 디스크를 뺐어요 · 그 사진은 '연결 안 됨'으로 남겨 둘게요")
+                    self.rescan()
+                }
+            }
+        }
         let fixed = all.filter(\.dateFixed).count
         if fixed > 0 { notify("촬영 날짜가 없거나 이상한 사진 \(fixed.formatted())장은 폴더 이름 날짜로 보여줘요") }
     }
@@ -875,7 +960,7 @@ final class Model: ObservableObject {
     @Published var unanalyzedCount = 0
     private var stopAnalysis = false
 
-    func needsAnalysis(_ p: Photo) -> Bool { p.dog == nil && analyzableExts.contains(p.ext) }
+    func needsAnalysis(_ p: Photo) -> Bool { p.dog == nil && !p.offline && analyzableExts.contains(p.ext) }
 
     func passesContent(_ p: Photo) -> Bool { (!dogOnly || p.dog == true) && (!videoOnly || p.isVideo) && passesCamera(p) }
     @Published var videoOnly: Bool = pref("videoOnly", false) {
@@ -1142,6 +1227,7 @@ final class Model: ObservableObject {
         var loc: [Photo] = [], unloc: [Photo] = []
         var nGPS = 0, nEst = 0, nManual = 0
         let nFixed = all.reduce(0) { $0 + ($1.dateFixed ? 1 : 0) }
+        let nOffline = all.reduce(0) { $0 + ($1.offline ? 1 : 0) }
         var mPaths: Set<String> = []
         for var p in all {
             if p.isRaw, let c = pairContent[(p.path as NSString).deletingPathExtension.lowercased()] {
@@ -1174,6 +1260,7 @@ final class Model: ObservableObject {
         locatedVersion += 1
         stats = "GPS \(nGPS.formatted()) · 추정 \(nEst.formatted()) · 지정 \(nManual.formatted()) · 위치 없음 \(unloc.count.formatted()) · 중복 \(duplicates.count.formatted())"
             + (nFixed > 0 ? " · 폴더 날짜 \(nFixed.formatted())" : "")
+            + (nOffline > 0 ? " · 외장 연결 안 됨 \(nOffline.formatted())" : "")
         recompute()
         recomputeUnlocated()
         recomputeAll()
@@ -2240,6 +2327,9 @@ struct Thumb: View {
                     if !copies.isEmpty { tagLabel("중복 \(copies.count + 1)", .orange.opacity(0.9)) }
                     if photo.dateFixed { tagLabel("폴더 날짜", .teal.opacity(0.9)) }
                 } }
+            }
+            .overlay(alignment: .bottom) {
+                if photo.offline { tagLabel("외장 연결 안 됨", .gray.opacity(0.85)) }
             }
             .overlay(alignment: .topTrailing) {
                 if isSelected {
