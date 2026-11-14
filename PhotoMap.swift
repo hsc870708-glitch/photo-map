@@ -805,6 +805,7 @@ final class Model: ObservableObject {
     /// 지금 '지정' 위치로 보이는 사진 경로(선택 개수 세기용)
     private var manualPaths: Set<String> = []
     private var byPath: [String: Photo] = [:]
+    func byPathPhoto(_ path: String) -> Photo? { byPath[path] }
     private var resolvedByPath: [String: Photo] = [:]
     /// 경로 → 같은 파일의 다른 사본 경로들(중복이 있는 사진만)
     private(set) var duplicates: [String: [String]] = [:]
@@ -4299,11 +4300,10 @@ struct InfoView: View {
                 LabeledContent("강아지", value: label != nil ? (label! ? "강아지임 (직접)" : "강아지 아님 (직접)")
                                 : (p.dog == nil ? "아직 분석 안 함" : (p.dog! ? "있음 (자동 분석)" : "없음 (자동 분석)")))
                 let copies = model.duplicates[p.path] ?? []
-                LabeledContent("중복", value: copies.isEmpty ? "없음" : "다른 곳에 \(copies.count)개")
-                ForEach(copies, id: \.self) { c in
-                    Button(relativePath(c)) { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: c)]) }
-                        .buttonStyle(.link).lineLimit(1).truncationMode(.head)
-                }
+                LabeledContent("중복", value: copies.isEmpty ? "없음" : "같은 파일 \(copies.count + 1)개")
+            }
+            if let copies = model.duplicates[p.path], !copies.isEmpty {
+                duplicateSection(p, copies)
             }
         }
         .formStyle(.grouped)
@@ -4489,6 +4489,56 @@ struct PhotoMapApp: App {
 
         Settings {
             SettingsView(model: model)
+        }
+    }
+}
+
+
+// MARK: - 중복 사본 비교 (어느 폴더에 있는지 보고 하나를 지운다)
+
+extension InfoView {
+    /// 사본이 어디에 있는지: 외장 디스크면 디스크 이름, 아니면 맥
+    static func place(_ path: String) -> String {
+        guard path.hasPrefix("/Volumes/") else { return "맥" }
+        return String(path.dropFirst(9).split(separator: "/").first ?? "외장")
+    }
+
+    @ViewBuilder
+    func duplicateSection(_ p: Photo, _ copies: [String]) -> some View {
+        let members = ([p.path] + copies).compactMap { model.byPathPhoto($0) }.sorted { model.rank($0) < model.rank($1) }
+        Section {
+            ForEach(members, id: \.path) { m in
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: m.path.hasPrefix("/Volumes/") ? "externaldrive" : "laptopcomputer")
+                        .foregroundStyle(.secondary).frame(width: 18)
+                        .help(Self.place(m.path))
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 4) {
+                            Text(m.parentFolder).fontWeight(m.path == p.path ? .semibold : .regular)
+                                .lineLimit(2).truncationMode(.head)
+                            if m.path == p.path { tagLabel("지금 사진", .accentColor.opacity(0.85)).padding(-4) }
+                        }
+                        Text("\(Self.place(m.path)) · \((m.path as NSString).lastPathComponent)"
+                             + (m.offline ? " · 연결 안 됨" : ""))
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        if m.path == members.first?.path {
+                            Text("하나만 남긴다면 이걸 남기길 추천 (정리된 폴더·짧은 경로)")
+                                .font(.caption2).foregroundStyle(.green)
+                        }
+                    }
+                    Spacer(minLength: 4)
+                    Button { NSWorkspace.shared.activateFileViewerSelecting([m.url]) } label: { Image(systemName: "folder") }
+                        .buttonStyle(.borderless).help("Finder에서 보기").disabled(m.offline)
+                    Button { model.requestDelete(selection: [m.path]) } label: { Image(systemName: "trash") }
+                        .buttonStyle(.borderless).help("이 사본을 휴지통으로 (⌘Z로 되돌리기)").disabled(m.offline)
+                }
+                .padding(.vertical, 2)
+            }
+        } header: {
+            Text("같은 파일이 있는 곳 \(members.count)군데")
+        } footer: {
+            Text("휴지통 버튼은 그 사본만 휴지통으로 옮겨요. 마지막 하나는 지우지 않아요.")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 }
