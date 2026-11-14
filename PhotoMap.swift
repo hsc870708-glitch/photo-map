@@ -806,6 +806,14 @@ final class Model: ObservableObject {
     private var manualPaths: Set<String> = []
     private var byPath: [String: Photo] = [:]
     func byPathPhoto(_ path: String) -> Photo? { byPath[path] }
+
+    /// 중복 사진 썸네일 아래 글자: "💾 My Passport · 폴더" 또는 "폴더", 그리고 하나만 남긴다면 이 사본인지
+    func duplicateCaption(_ p: Photo) -> (text: String, keep: Bool)? {
+        guard let copies = duplicates[p.path], !copies.isEmpty else { return nil }
+        let best = ([p] + copies.compactMap { byPath[$0] }).min { rank($0) < rank($1) }
+        let disk = p.path.hasPrefix("/Volumes/") ? "💾 " + InfoView.place(p.path) + " · " : ""
+        return (disk + p.parentFolder + (p.offline ? " (연결 안 됨)" : ""), best?.path == p.path)
+    }
     private var resolvedByPath: [String: Photo] = [:]
     /// 경로 → 같은 파일의 다른 사본 경로들(중복이 있는 사진만)
     private(set) var duplicates: [String: [String]] = [:]
@@ -2295,9 +2303,28 @@ struct Thumb: View {
     var showLabels = true
     /// 끌 때 함께 끌 파일들(선택한 사진이면 선택 전체)
     var dragURLs: (() -> [URL])?
+    /// '중복만 보기'일 때 썸네일 아래에 보여줄 폴더(외장 디스크면 디스크 이름도)와, 하나만 남긴다면 남길 사본인지
+    var folderCaption: (text: String, keep: Bool)? = nil
     @StateObject private var loader = ThumbLoader()
 
     var body: some View {
+        if let c = folderCaption {
+            VStack(spacing: 1) {
+                tile
+                Text(c.text)
+                    .font(.system(size: 10, weight: c.keep ? .semibold : .regular))
+                    .foregroundStyle(c.keep ? Color.green : Color.primary)
+                    .lineLimit(2).truncationMode(.head).multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .help(photo.path)
+                if c.keep { Text("남길 추천").font(.system(size: 9)).foregroundStyle(.green) }
+            }
+        } else {
+            tile
+        }
+    }
+
+    var tile: some View {
         Color.gray.opacity(0.15)
             .aspectRatio(1, contentMode: .fit)
             .overlay {
@@ -2651,7 +2678,8 @@ func thumbCell(_ model: Model, _ p: Photo, _ tab: Mode) -> Thumb {
                  onSetDog: { model.setDog(p, selection: sel, $0) },
                  selectionCount: inSel ? sel.count : 0,
                  showLabels: model.showLabels,
-                 dragURLs: { model.dragURLs(for: p, in: tab) })
+                 dragURLs: { model.dragURLs(for: p, in: tab) },
+                 folderCaption: model.duplicatesOnly ? model.duplicateCaption(p) : nil)
 }
 
 /// 오래 걸리는 작업의 진행 막대
