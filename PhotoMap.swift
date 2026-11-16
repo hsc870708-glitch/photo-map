@@ -48,6 +48,76 @@ let supportDir: URL = {
 let cacheURL = supportDir.appendingPathComponent("photos-v2.json")
 /// 사용자가 직접 지정한 위치. 사진 파일은 건드리지 않고 여기에만 저장한다
 let manualURL = supportDir.appendingPathComponent("manual-locations.json")
+/// 가져온 구글 지도 타임라인 지점 [[시각(초), 위도, 경도], …] (시각순)
+let timelineURL = supportDir.appendingPathComponent("timeline-points.json")
+
+/// 시간 추정의 기준이 된 것: GPS 사진, 위치를 지정한 사진, 구글 타임라인
+enum RefKind { case gps, manual, timeline }
+
+/// 구글 지도 타임라인(휴대폰 → 설정 → 타임라인 내보내기)에서 (시각, 위도, 경도) 지점을 뽑는다
+enum Timeline {
+    /// "35.87°, 128.72°" (안드로이드) 또는 "geo:35.87,128.72" (아이폰)
+    static func latLng(_ any: Any?) -> (Double, Double)? {
+        guard var s = any as? String else { return nil }
+        s = s.replacingOccurrences(of: "geo:", with: "").replacingOccurrences(of: "°", with: "")
+        let parts = s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count == 2, let a = Double(parts[0]), let b = Double(parts[1]), !(a == 0 && b == 0) else { return nil }
+        return (a, b)
+    }
+
+    static func time(_ any: Any?) -> Double? {
+        guard let s = any as? String else { return nil }
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d.timeIntervalSince1970 }
+        f.formatOptions = [.withInternetDateTime]
+        return f.date(from: s)?.timeIntervalSince1970
+    }
+
+    static func points(_ data: Data) -> [[Double]]? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        var out: [[Double]] = []
+        func add(_ t: Double?, _ ll: (Double, Double)?) {
+            if let t, let ll { out.append([t, ll.0, ll.1]) }
+        }
+        // 머문 곳은 머문 시간 내내 10분 간격으로 지점을 채운다(가운데 찍은 사진도 찾을 수 있게)
+        func visit(_ start: Double?, _ end: Double?, _ ll: (Double, Double)?) {
+            guard let start, let end, let ll, end >= start, end - start < 86_400 * 3 else { return }
+            var t = start
+            while t < end { out.append([t, ll.0, ll.1]); t += 600 }
+            out.append([end, ll.0, ll.1])
+        }
+        let segments = (root as? [String: Any])?["semanticSegments"] as? [[String: Any]] ?? (root as? [[String: Any]] ?? [])
+        for seg in segments {
+            let start = time(seg["startTime"]), end = time(seg["endTime"])
+            for p in seg["timelinePath"] as? [[String: Any]] ?? [] {
+                if let t = time(p["time"]) { add(t, latLng(p["point"])) }
+                else if let start, let off = Double(p["durationMinutesOffsetFromStartTime"] as? String ?? "") {
+                    add(start + off * 60, latLng(p["point"]))
+                }
+            }
+            if let v = seg["visit"] as? [String: Any], let c = v["topCandidate"] as? [String: Any] {
+                let place = c["placeLocation"]
+                visit(start, end, latLng((place as? [String: Any])?["latLng"] ?? place))
+            }
+            if let a = seg["activity"] as? [String: Any] {
+                add(start, latLng((a["start"] as? [String: Any])?["latLng"] ?? a["start"]))
+                add(end, latLng((a["end"] as? [String: Any])?["latLng"] ?? a["end"]))
+            }
+        }
+        for r in (root as? [String: Any])?["rawSignals"] as? [[String: Any]] ?? [] {
+            guard let p = r["position"] as? [String: Any], (p["accuracyMeters"] as? Double ?? 0) <= 200 else { continue }
+            add(time(p["timestamp"]), latLng(p["LatLng"]))
+        }
+        // 예전 구글 테이크아웃 Records.json
+        for l in (root as? [String: Any])?["locations"] as? [[String: Any]] ?? [] {
+            guard let la = l["latitudeE7"] as? Double, let lo = l["longitudeE7"] as? Double,
+                  (l["accuracy"] as? Double ?? 0) <= 200 else { continue }
+            add(time(l["timestamp"]), (la / 1e7, lo / 1e7))
+        }
+        return out
+    }
+}
 /// 사용자가 우클릭으로 직접 정한 '강아지임/아님'. 자동 분석보다 우선하고, 위치 지정과 같은 식별자(이름+촬영 시각)로 저장한다
 let dogLabelsURL = supportDir.appendingPathComponent("dog-labels.json")
 
@@ -671,7 +741,7 @@ final class Model: ObservableObject {
         didSet { prefs.set(estimateMinutes, forKey: "estimateMinutes"); resolve() }
     }
     /// 추정 사진이 어느 사진(GPS 또는 직접 지정)의 위치를 빌렸는지(정보 창에 보여준다): 경로 → (기준 사진 경로, 시간 차 초, 지정 사진인지)
-    private(set) var estimateRef: [String: (path: String, dt: Double, manual: Bool)] = [:]
+    private(set) var estimateRef: [String: (path: String, dt: Double, kind: RefKind)] = [:]
     /// 지도 탭에서 '추정' 사진만 보기
     @Published var estimatedOnly = false { didSet { recompute(); schedulePins() } }
     /// 사본이 있는 사진만 보기
@@ -862,6 +932,11 @@ final class Model: ObservableObject {
            let m = try? JSONDecoder().decode([String: [Double]].self, from: data) {
             manual = m
         }
+        if let data = try? Data(contentsOf: timelineURL),
+           let t = try? JSONDecoder().decode([[Double]].self, from: data) {
+            timeline = t.filter { $0.count == 3 }
+            updateTimelineSummary()
+        }
         if let data = try? Data(contentsOf: cacheURL),
            let cached = try? JSONDecoder().decode([Photo].self, from: data) {
             all = prepared(cached)
@@ -888,6 +963,62 @@ final class Model: ObservableObject {
 
     @Published var roots: [URL] = photoRoots
     @Published var showRoots = false
+
+    // MARK: 구글 타임라인
+
+    /// 가져온 타임라인 지점(시각순). 시간 추정의 기준으로 GPS 사진과 함께 쓴다
+    private var timeline: [[Double]] = []
+    @Published var timelineSummary = ""
+
+    private func updateTimelineSummary() {
+        guard let a = timeline.first?[0], let b = timeline.last?[0] else { timelineSummary = ""; return }
+        let f = DateFormatter(); f.dateFormat = "yyyy.M.d"
+        timelineSummary = "\(timeline.count.formatted())개 지점 · \(f.string(from: Date(timeIntervalSince1970: a))) ~ \(f.string(from: Date(timeIntervalSince1970: b)))"
+    }
+
+    func chooseTimeline() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = true
+        panel.prompt = "가져오기"
+        panel.message = "구글 지도에서 내보낸 타임라인 파일(Timeline.json)을 고르세요"
+        guard panel.runModal() == .OK else { return }
+        importTimeline(panel.urls)
+    }
+
+    /// 여러 번 가져와도 된다(같은 시각은 하나로 합친다)
+    func importTimeline(_ urls: [URL]) {
+        notify("타임라인 읽는 중…")
+        let old = timeline
+        Task.detached {
+            var found = 0, bad = 0
+            var byT: [Int: [Double]] = [:]
+            for p in old { byT[Int(p[0])] = p }
+            for u in urls {
+                guard let data = try? Data(contentsOf: u), let pts = Timeline.points(data), !pts.isEmpty else { bad += 1; continue }
+                found += pts.count
+                for p in pts { byT[Int(p[0])] = p }
+            }
+            let merged = byT.values.sorted { $0[0] < $1[0] }
+            if let data = try? JSONEncoder().encode(merged) { try? data.write(to: timelineURL) }
+            let (f, b) = (found, bad)
+            await MainActor.run {
+                self.timeline = merged
+                self.updateTimelineSummary()
+                self.resolve()
+                self.notify(f == 0 ? "타임라인 지점을 찾지 못했어요 (구글 지도 타임라인 파일이 맞는지 확인해 주세요)"
+                            : "타임라인을 가져왔어요 · \(self.timelineSummary)" + (b > 0 ? " (\(b)개 파일은 못 읽음)" : ""))
+            }
+        }
+    }
+
+    func clearTimeline() {
+        timeline = []
+        try? FileManager.default.removeItem(at: timelineURL)
+        updateTimelineSummary()
+        resolve()
+        notify("타임라인을 지웠어요")
+    }
 
     private func saveRoots(_ list: [URL]) {
         photoRoots = list
@@ -1203,17 +1334,18 @@ final class Model: ObservableObject {
                   m.count == 2 else { return nil }
             return m
         }
-        typealias Ref = (t: Double, lat: Double, lon: Double, path: String, manual: Bool)
-        let refs: [Ref] = all.compactMap { p in
+        // 구글 타임라인 지점도 기준이 된다(휴대폰이 있던 곳)
+        typealias Ref = (t: Double, lat: Double, lon: Double, path: String, kind: RefKind)
+        let refs: [Ref] = (all.compactMap { p -> Ref? in
             guard !p.dateFixed, let d = p.date else { return nil }
             if p.source == .gps, let lat = p.lat, let lon = p.lon {
-                return (d.timeIntervalSince1970, lat, lon, p.path, false)
+                return (d.timeIntervalSince1970, lat, lon, p.path, .gps)
             }
-            if let m = manualLoc(p) { return (d.timeIntervalSince1970, m[0], m[1], p.path, true) }
+            if let m = manualLoc(p) { return (d.timeIntervalSince1970, m[0], m[1], p.path, .manual) }
             return nil
-        }.sorted { $0.t < $1.t }
+        } + timeline.map { ($0[0], $0[1], $0[2], "", .timeline) }).sorted { $0.t < $1.t }
         let window = Double(estimateMinutes) * 60
-        var refOf: [String: (path: String, dt: Double, manual: Bool)] = [:]
+        var refOf: [String: (path: String, dt: Double, kind: RefKind)] = [:]
 
         func nearest(_ t: Double) -> Ref? {
             guard !refs.isEmpty else { return nil }
@@ -1253,7 +1385,7 @@ final class Model: ObservableObject {
             } else if useEstimate, !p.dateFixed, let d = p.date, let n = nearest(d.timeIntervalSince1970),
                       abs(n.t - d.timeIntervalSince1970) <= window {
                 p.lat = n.lat; p.lon = n.lon; p.source = .estimated
-                refOf[p.path] = (n.path, d.timeIntervalSince1970 - n.t, n.manual)
+                refOf[p.path] = (n.path, d.timeIntervalSince1970 - n.t, n.kind)
                 nEst += 1
             } else {
                 unloc.append(p)
@@ -3260,6 +3392,7 @@ struct WorkMenuItems: View {
         }
         .disabled(model.checkingDuplicates || model.queue.contains(.duplicates))
         Divider()
+        Button("📍 구글 타임라인 가져오기…") { model.chooseTimeline() }
         Button("사진 폴더 관리…") { openSettings() }
     }
 }
@@ -4081,7 +4214,16 @@ struct SettingsView: View {
                         }
                     }
                     .disabled(!model.useEstimate)
-                    Text("이 시간 안에 찍힌 GPS 사진(또는 위치를 지정한 사진)이 있으면 그 위치를 빌려 써요. 넓힐수록 많이 채워지지만 틀릴 가능성도 커져요.")
+                    Text("이 시간 안에 찍힌 GPS 사진(또는 위치를 지정한 사진, 구글 타임라인)이 있으면 그 위치를 빌려 써요. 넓힐수록 많이 채워지지만 틀릴 가능성도 커져요.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("구글 타임라인") {
+                    LabeledContent("가져온 기록", value: model.timelineSummary.isEmpty ? "없음" : model.timelineSummary)
+                    HStack {
+                        Button("타임라인 파일 가져오기…") { model.chooseTimeline() }
+                        Button("지우기") { model.clearTimeline() }.disabled(model.timelineSummary.isEmpty)
+                    }
+                    Text("휴대폰 구글 지도 → 설정 → 위치 및 개인정보 보호 → 타임라인 데이터 내보내기로 만든 Timeline.json. 휴대폰이 있던 곳을 기준으로 카메라 사진의 위치를 추정해요. 기록은 앱 안에만 저장돼요.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("촬영 날짜") {
@@ -4314,7 +4456,9 @@ struct InfoView: View {
                 if p.source == .estimated, let ref = model.estimateRef[p.path] {
                     let min = Int((abs(ref.dt) / 60).rounded())
                     LabeledContent("추정 근거") {
-                        Text("\((ref.path as NSString).lastPathComponent) · \(min == 0 ? "1분 안쪽" : "\(min)분") \(ref.dt >= 0 ? "전에" : "뒤에") 찍힌 \(ref.manual ? "위치 지정한" : "GPS") 사진")
+                        let when = "\(min == 0 ? "1분 안쪽" : "\(min)분") \(ref.dt >= 0 ? "전" : "뒤")"
+                        Text(ref.kind == .timeline ? "구글 타임라인 · \(when) 휴대폰 위치"
+                             : "\((ref.path as NSString).lastPathComponent) · \(when)에 찍힌 \(ref.kind == .manual ? "위치 지정한" : "GPS") 사진")
                             .multilineTextAlignment(.trailing)
                     }
                 }
@@ -4375,6 +4519,7 @@ struct HelpView: View {
                 """)
                 helpSection("위치 정하기", """
                 **추정** — GPS 없는 사진은 앞뒤 30분(설정에서 변경) 안의 GPS 사진 위치를 빌려 써요. 위치를 **지정**한 사진도 기준이 돼서, GPS가 끊긴 구간은 한 장만 지정하면 앞뒤 사진이 따라와요.
+                **구글 타임라인** — 작업 메뉴 → 구글 타임라인 가져오기…로 휴대폰 위치 기록(Timeline.json)을 넣으면, 그 시간에 휴대폰이 있던 곳으로도 추정해요.
                 **지정** — 사진을 고르고 장소를 검색해 원을 옮긴 뒤, 아래 작업 막대의 **위치 → 원 위치로 지정**.
                 추정이 맞으면 **추정 위치 맞음 · 확정**. 사진 파일은 바뀌지 않고 앱 안에만 저장돼요.
                 """)
