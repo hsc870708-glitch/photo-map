@@ -746,7 +746,7 @@ final class Model: ObservableObject {
     @Published var estimatedOnly = false { didSet { recompute(); schedulePins() } }
     /// 사본이 있는 사진만 보기
     @Published var duplicatesOnly = false { didSet { recompute(); recomputeUnlocated(); recomputeAll() } }
-    /// 유사 의심만 보기: 파일 이름 앞 18자리(YYYYMMDD_HHMMSS_기종 규칙의 날짜·시각 + 기종 앞 두 글자)가 같은 사진
+    /// 유사 의심만 보기: 파일 이름 앞 18자리(YYYYMMDD_HHMMSS_기종 규칙의 날짜·시각 + 기종 앞 두 글자)가 같은 사진이 다른 폴더에 있는 것
     @Published var similarOnly = false { didSet { recompute(); recomputeUnlocated(); recomputeAll() } }
     /// 같은 파일의 사본은 하나만 보기
     /// 켜면 파일 이름(확장자 포함, 대소문자 무시)까지 같아야 중복으로 본다
@@ -1331,18 +1331,18 @@ final class Model: ObservableObject {
             acc + ((kv.value > 1 || checkedKeys[kv.key] != nil) ? kv.value : 0)
         }
         duplicateCount = dups.count
-        // 유사 의심: 이름이 '20261111_141324_r6m2…'처럼 날짜_시각_으로 시작하고 앞 18자리가 같은 파일.
-        // 같은 폴더의 같은 이름 JPG/CR3 쌍은 한 장으로 센다(쌍만 있으면 의심 아님)
+        // 유사 의심: 이름이 '20261111_141324_r6m2…'처럼 날짜_시각_으로 시작하고 앞 18자리가 같은 파일이
+        // 서로 다른 폴더에 있을 때. 한 폴더 안의 _2·_3은 같은 1초에 찍은 연사라 빼고,
+        // RAW(CR3)는 RAW끼리만 비교한다(JPG·RAW를 다른 폴더에 나눠 둔 쌍은 의심 아님)
         var simGroups: [String: [Photo]] = [:]
         for p in all {
             let name = (p.path as NSString).lastPathComponent.lowercased()
             guard name.count >= 18, name.range(of: "^[0-9]{8}_[0-9]{6}_", options: .regularExpression) != nil else { continue }
-            simGroups[String(name.prefix(18)), default: []].append(p)
+            simGroups[String(name.prefix(18)) + (p.isRaw ? "|raw" : ""), default: []].append(p)
         }
         var sim: [String: String] = [:]
         for (k, ps) in simGroups where ps.count > 1 {
-            let shots = Set(ps.map { ($0.path as NSString).deletingPathExtension.lowercased() })
-            guard shots.count > 1 else { continue }
+            guard Set(ps.map { ($0.path as NSString).deletingLastPathComponent }).count > 1 else { continue }
             for p in ps { sim[p.path] = k }
         }
         similarKey = sim
@@ -3131,7 +3131,7 @@ struct FilterIcons: View {
             FilterIcon(symbol: "square.on.square", tip: "중복 사진만 보기", isOn: $model.duplicatesOnly, hover: hover)
             FilterIcon(symbol: "1.square", tip: "중복은 1장만 보기", isOn: $model.oneCopyOnly, hover: hover)
             FilterIcon(symbol: "questionmark.square.dashed",
-                       tip: "유사 의심만 보기 · 파일 이름 앞 18자리(날짜_시각_기종)가 같은 사진 \(model.similarCount.formatted())묶음",
+                       tip: "유사 의심만 보기 · 파일 이름 앞 18자리(날짜_시각_기종)가 같은 사진이 다른 폴더에 있는 것 \(model.similarCount.formatted())묶음",
                        isOn: $model.similarOnly, hover: hover)
             divider
             FilterIcon(symbol: "tag", tip: "사진 라벨 보기 (추정·지정·직접·중복)", isOn: $model.showLabels, hover: hover)
