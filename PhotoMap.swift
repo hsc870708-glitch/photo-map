@@ -1760,8 +1760,6 @@ final class Model: ObservableObject {
 
     /// 키보드로 움직이는 현재 칸(선택의 기준점). 바뀌면 목록이 그 칸까지 스크롤한다
     @Published var cursor: String?
-    /// 썸네일 대신 파일 이름 목록으로 보기(누른 줄은 썸네일을 살짝 펼쳐 보여준다)
-    @Published var fileList: Bool = pref("fileList", false) { didSet { prefs.set(fileList, forKey: "fileList") } }
     /// 목록 폭에 맞춰 한 줄에 들어가는 썸네일 수(위아래 화살표 이동용)
     var gridColumnCount = 4
 
@@ -2952,7 +2950,7 @@ struct FolderSectionView<T: View>: View {
     let columns: [GridItem]
     let toggleOpen: () -> Void
     let toggleAll: ([Photo]) -> Void
-    @ViewBuilder let cells: ([Photo]) -> T
+    @ViewBuilder let thumb: (Photo) -> T
 
     var body: some View {
         let picked = sec.photos.reduce(0) { $0 + (selected.contains($1.path) ? 1 : 0) }
@@ -2984,8 +2982,10 @@ struct FolderSectionView<T: View>: View {
                     Button("이 날 전체") { toggleAll(d.photos) }.controlSize(.mini)
                 }
                 .padding(.leading, 18)
-                cells(d.photos)
-                    .padding(.leading, 18)
+                LazyVGrid(columns: columns, spacing: 4) {
+                    ForEach(d.photos) { thumb($0) }
+                }
+                .padding(.leading, 18)
             }
             Divider()
         }
@@ -3269,11 +3269,6 @@ struct ListHeader: View {
                 } label: { Image(systemName: "folder.badge.plus") }
                     .menuStyle(.borderlessButton).fixedSize().help("반경 안 사진 전체를 한 폴더로 모아요")
             }
-            Picker("", selection: $model.fileList) {
-                Image(systemName: "square.grid.2x2").tag(false).help("썸네일로 보기")
-                Image(systemName: "list.bullet").tag(true).help("파일 이름 목록으로 보기")
-            }
-            .pickerStyle(.segmented).labelsHidden().fixedSize()
             Picker("", selection: byFolder) {
                 Text("날짜별").tag(false)
                 Text("폴더별").tag(true)
@@ -3312,7 +3307,7 @@ struct PhotoList: View {
                     ForEach(folders) { sec in
                         FolderSectionView(sec: sec, isOpen: model.isFolderOpen(tab, sec.id), selected: sel, columns: cols,
                                           toggleOpen: { model.toggleFolderOpen(tab, sec.id) },
-                                          toggleAll: { model.toggleGroup($0, in: tab) }) { PhotoCells(model: model, photos: $0, tab: tab, columns: cols) }
+                                          toggleAll: { model.toggleGroup($0, in: tab) }) { thumbCell(model, $0, tab).id($0.path) }
                     }
                 }
             } else {
@@ -3323,7 +3318,9 @@ struct PhotoList: View {
                             Spacer()
                             Button("이 날 전체") { model.toggleGroup(g.photos, in: tab) }.controlSize(.small)
                         }
-                        PhotoCells(model: model, photos: g.photos, tab: tab, columns: cols)
+                        LazyVGrid(columns: cols, spacing: 4) {
+                            ForEach(g.photos) { thumbCell(model, $0, tab).id($0.path) }
+                        }
                     }
                 }
             }
@@ -4810,118 +4807,5 @@ extension InfoView {
             Text("휴지통 버튼은 그 사본만 휴지통으로 옮겨요. 마지막 하나는 지우지 않아요.")
                 .font(.caption).foregroundStyle(.secondary)
         }
-    }
-}
-
-
-// MARK: - 파일 이름 목록 보기
-
-/// 사진 묶음 하나를 썸네일 격자 또는 파일 이름 목록으로 보여준다
-struct PhotoCells: View {
-    @ObservedObject var model: Model
-    let photos: [Photo]
-    let tab: Mode
-    let columns: [GridItem]
-
-    var body: some View {
-        if model.fileList {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(photos) { p in
-                    FileRow(model: model, photo: p, tab: tab).id(p.path)
-                    Divider().opacity(0.5)
-                }
-            }
-        } else {
-            LazyVGrid(columns: columns, spacing: 4) {
-                ForEach(photos) { thumbCell(model, $0, tab).id($0.path) }
-            }
-        }
-    }
-}
-
-/// 파일 이름 한 줄. 누르면 그 줄 아래에 썸네일을 펼쳐 보여준다(다른 줄을 누르면 접힌다)
-struct FileRow: View {
-    @ObservedObject var model: Model
-    let photo: Photo
-    let tab: Mode
-    @StateObject private var loader = ThumbLoader()
-
-    static let dateFormat: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "yyyy.MM.dd HH:mm:ss"; return f
-    }()
-
-    var body: some View {
-        let sel = model.selection(tab)
-        let picked = sel.contains(photo.path)
-        let open = model.cursor == photo.path
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Image(systemName: photo.isVideo ? "film" : photo.isRaw ? "camera.aperture" : "photo")
-                    .foregroundStyle(.secondary).frame(width: 16)
-                Text((photo.path as NSString).lastPathComponent)
-                    .font(.system(.callout, design: .monospaced))
-                    .lineLimit(1).truncationMode(.middle)
-                if let k = model.duplicates[photo.path], !k.isEmpty { tagLabel("중복 \(k.count + 1)", .orange.opacity(0.9)).padding(-4) }
-                if photo.offline { tagLabel("연결 안 됨", .gray.opacity(0.85)).padding(-4) }
-                Spacer(minLength: 6)
-                Text(photo.shownDate.map { Self.dateFormat.string(from: $0) } ?? "날짜 없음")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                Text(photo.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 60, alignment: .trailing)
-            }
-            .contentShape(Rectangle())
-            // 클릭(⌘·⇧ 여러 장 선택, 더블클릭 열기)과 블로그로 끌기는 썸네일과 똑같이
-            .overlay {
-                DragClickSource(onClick: { model.click(photo, in: tab) },
-                                urls: { model.dragURLs(for: photo, in: tab) },
-                                image: { ThumbCache.shared.object(forKey: photo.path as NSString) })
-            }
-            if open {
-                HStack(alignment: .top, spacing: 10) {
-                    Group {
-                        if let img = loader.image {
-                            Image(nsImage: img).resizable().scaledToFit()
-                        } else {
-                            Color.gray.opacity(0.15).overlay(ProgressView().controlSize(.small))
-                        }
-                    }
-                    .frame(width: 180, height: 180)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(photo.parentFolder).font(.caption).foregroundStyle(.secondary).lineLimit(3)
-                        Button("열기") { NSWorkspace.shared.open(photo.url) }.controlSize(.small)
-                        Button("Finder에서 보기") { NSWorkspace.shared.activateFileViewerSelecting([photo.url]) }.controlSize(.small)
-                        Button(role: .destructive) { model.requestDelete(photo, selection: sel) } label: {
-                            Label(picked && sel.count > 1 ? "선택한 \(sel.count)장 휴지통으로" : "휴지통으로", systemImage: "trash")
-                        }
-                        .controlSize(.small).disabled(photo.offline)
-                    }
-                }
-                .padding(.leading, 24)
-                .task(id: photo.path) {
-                    if let hit = ThumbCache.shared.object(forKey: photo.path as NSString) { loader.image = hit; return }
-                    let p = photo
-                    if let img = await Task.detached(priority: .userInitiated, operation: { ThumbStore.image(for: p) }).value {
-                        loader.image = img
-                    } else {
-                        // 영상 등은 훑어보기로
-                        let req = QLThumbnailGenerator.Request(fileAt: p.url, size: CGSize(width: 180, height: 180),
-                                                               scale: 2, representationTypes: .thumbnail)
-                        loader.image = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: req).nsImage
-                    }
-                }
-            }
-        }
-        .padding(.vertical, 4).padding(.horizontal, 6)
-        .background(picked ? Color.accentColor.opacity(0.18) : Color.clear)
-        .contextMenu {
-            Button("열기") { NSWorkspace.shared.open(photo.url) }
-            Button("Finder에서 보기") { NSWorkspace.shared.activateFileViewerSelecting([photo.url]) }
-            Divider()
-            Button(picked && sel.count > 1 ? "선택한 \(sel.count)장 휴지통으로 이동" : "휴지통으로 이동", role: .destructive) {
-                model.requestDelete(photo, selection: sel)
-            }
-        }
-        .help(photo.path)
     }
 }
