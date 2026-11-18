@@ -4872,12 +4872,7 @@ struct FileRow: View {
             .contentShape(Rectangle())
             // 클릭(⌘·⇧ 여러 장 선택, 더블클릭 열기)과 블로그로 끌기는 썸네일과 똑같이
             .overlay {
-                DragClickSource(onClick: {
-                    // 펼친 줄을 한 번 더 누르면 접는다(⌘·⇧ 클릭과 더블클릭은 평소대로)
-                    let plain = NSEvent.modifierFlags.intersection([.command, .shift]).isEmpty
-                    if open && plain && (NSApp.currentEvent?.clickCount ?? 1) == 1 { model.cursor = nil }
-                    else { model.click(photo, in: tab) }
-                },
+                DragClickSource(onClick: { model.click(photo, in: tab) },
                                 urls: { model.dragURLs(for: photo, in: tab) },
                                 image: { ThumbCache.shared.object(forKey: photo.path as NSString) })
             }
