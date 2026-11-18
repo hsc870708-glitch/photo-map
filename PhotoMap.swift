@@ -12,10 +12,12 @@ import Vision
 
 // MARK: - 설정
 
-/// 모은 사진이 만들어지는 곳: 첫 번째 사진 폴더 안의 Claude용/_사진지도/모음 (Claude용 폴더는 읽을 때 건너뛴다)
+/// 모은 사진이 만들어지는 곳: 첫 번째 사진 폴더 안의 _사진지도/모음.
+/// 그 안에 Claude용 폴더(작업 파일 모아 두는 곳)가 있으면 Claude용/_사진지도/모음 (두 폴더 모두 읽을 때 건너뛴다)
 var collectRoot: URL {
-    (photoRoots.first ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Pictures"))
-        .appendingPathComponent("Claude용/_사진지도/모음")
+    let base = photoRoots.first ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Pictures")
+    let work = base.appendingPathComponent("Claude용")
+    return (FileManager.default.fileExists(atPath: work.path) ? work : base).appendingPathComponent("_사진지도/모음")
 }
 let rootsDefaultsKey = "photoRoots"
 
@@ -4635,7 +4637,7 @@ struct HelpView: View {
                 **한 장 최대 용량**(기본 10MB)을 넘지 않게 자동으로 1번·2번…으로 나눠요. 목록에서 블로그로 바로 끌어다 넣어요.
                 """)
                 helpSection("모으기 · 되돌리기", """
-                작업 막대의 **모으기** → 바로가기(원본 그대로) 또는 복사. 첫 번째 사진 폴더 안 Claude용/_사진지도/모음/ 에 만들어져요.
+                작업 막대의 **모으기** → 바로가기(원본 그대로) 또는 복사. 첫 번째 사진 폴더 안 _사진지도/모음/ 에 만들어져요.
                 위치 지정·강아지 구분·휴지통 이동은 **⌘Z**로 되돌릴 수 있어요.
                 """)
                 helpSection("메뉴", """
