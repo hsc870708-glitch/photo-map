@@ -746,6 +746,8 @@ final class Model: ObservableObject {
     @Published var estimatedOnly = false { didSet { recompute(); schedulePins() } }
     /// 사본이 있는 사진만 보기
     @Published var duplicatesOnly = false { didSet { recompute(); recomputeUnlocated(); recomputeAll() } }
+    /// 유사 의심만 보기: 파일 이름 앞 18자리(YYYYMMDD_HHMMSS_기종 규칙의 날짜·시각 + 기종 앞 두 글자)가 같은 사진
+    @Published var similarOnly = false { didSet { recompute(); recomputeUnlocated(); recomputeAll() } }
     /// 같은 파일의 사본은 하나만 보기
     /// 켜면 파일 이름(확장자 포함, 대소문자 무시)까지 같아야 중복으로 본다
     @Published var sameNameOnly = UserDefaults.standard.object(forKey: "sameNameOnly") as? Bool ?? true {
@@ -831,6 +833,7 @@ final class Model: ObservableObject {
             if !allFilter.trimmingCharacters(in: .whitespaces).isEmpty { parts.append("'\(allFilter)' 포함") }
         }
         if duplicatesOnly { parts.append("중복만") }
+        if similarOnly { parts.append("유사 의심만") }
         if oneCopyOnly { parts.append("중복은 1개만") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
@@ -878,6 +881,13 @@ final class Model: ObservableObject {
     func byPathPhoto(_ path: String) -> Photo? { byPath[path] }
 
     /// 중복 사진 썸네일 아래 글자: "💾 My Passport · 폴더" 또는 "폴더", 그리고 하나만 남긴다면 이 사본인지
+    /// 유사 의심 썸네일 아래 글자: 파일 이름과 폴더(어느 게 어떤 파일인지 보고 고르게)
+    func similarCaption(_ p: Photo) -> (text: String, keep: Bool)? {
+        guard similarKey[p.path] != nil else { return nil }
+        let disk = p.path.hasPrefix("/Volumes/") ? "💾 " + InfoView.place(p.path) + " · " : ""
+        return ((p.path as NSString).lastPathComponent + "\n" + disk + p.parentFolder, false)
+    }
+
     func duplicateCaption(_ p: Photo) -> (text: String, keep: Bool)? {
         guard let copies = duplicates[p.path], !copies.isEmpty else { return nil }
         let best = ([p] + copies.compactMap { byPath[$0] }).min { rank($0) < rank($1) }
@@ -887,6 +897,9 @@ final class Model: ObservableObject {
     private var resolvedByPath: [String: Photo] = [:]
     /// 경로 → 같은 파일의 다른 사본 경로들(중복이 있는 사진만)
     private(set) var duplicates: [String: [String]] = [:]
+    /// 경로 → 유사 의심 묶음 키(파일 이름 앞 18자리)
+    private(set) var similarKey: [String: String] = [:]
+    @Published private(set) var similarCount = 0
     /// 경로 → 중복 묶음 키(사본이 있는 사진만)
     private var duplicateKey: [String: String] = [:]
     @Published var duplicateCount = 0
@@ -1318,6 +1331,22 @@ final class Model: ObservableObject {
             acc + ((kv.value > 1 || checkedKeys[kv.key] != nil) ? kv.value : 0)
         }
         duplicateCount = dups.count
+        // 유사 의심: 이름이 '20261111_141324_r6m2…'처럼 날짜_시각_으로 시작하고 앞 18자리가 같은 파일.
+        // 같은 폴더의 같은 이름 JPG/CR3 쌍은 한 장으로 센다(쌍만 있으면 의심 아님)
+        var simGroups: [String: [Photo]] = [:]
+        for p in all {
+            let name = (p.path as NSString).lastPathComponent.lowercased()
+            guard name.count >= 18, name.range(of: "^[0-9]{8}_[0-9]{6}_", options: .regularExpression) != nil else { continue }
+            simGroups[String(name.prefix(18)), default: []].append(p)
+        }
+        var sim: [String: String] = [:]
+        for (k, ps) in simGroups where ps.count > 1 {
+            let shots = Set(ps.map { ($0.path as NSString).deletingPathExtension.lowercased() })
+            guard shots.count > 1 else { continue }
+            for p in ps { sim[p.path] = k }
+        }
+        similarKey = sim
+        similarCount = Set(sim.values).count
         // 예전 버전은 경로를 키로 저장했다. 지금 있는 파일이면 새 식별자로 옮긴다
         var migrated = false
         for (k, v) in manual where k.hasPrefix("/") {
@@ -1457,6 +1486,7 @@ final class Model: ObservableObject {
     func applyDuplicateFilters(_ list: [Photo]) -> [Photo] {
         var out = list
         if duplicatesOnly { out = out.filter { duplicateKey[$0.path] != nil } }
+        if similarOnly { out = out.filter { similarKey[$0.path] != nil } }
         if oneCopyOnly {
             var best: [String: Photo] = [:]
             for p in out {
@@ -2446,7 +2476,7 @@ struct Thumb: View {
                 Text(c.text)
                     .font(.system(size: 10, weight: c.keep ? .semibold : .regular))
                     .foregroundStyle(c.keep ? Color.green : Color.primary)
-                    .lineLimit(2).truncationMode(.head).multilineTextAlignment(.center)
+                    .lineLimit(3).truncationMode(.head).multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
                     .help(photo.path)
                 if c.keep { Text("남길 추천").font(.system(size: 9)).foregroundStyle(.green) }
@@ -2811,7 +2841,8 @@ func thumbCell(_ model: Model, _ p: Photo, _ tab: Mode) -> Thumb {
                  selectionCount: inSel ? sel.count : 0,
                  showLabels: model.showLabels,
                  dragURLs: { model.dragURLs(for: p, in: tab) },
-                 folderCaption: model.duplicatesOnly ? model.duplicateCaption(p) : nil)
+                 folderCaption: model.similarOnly ? model.similarCaption(p)
+                    : model.duplicatesOnly ? model.duplicateCaption(p) : nil)
 }
 
 /// 오래 걸리는 작업의 진행 막대
@@ -3099,6 +3130,9 @@ struct FilterIcons: View {
             divider
             FilterIcon(symbol: "square.on.square", tip: "중복 사진만 보기", isOn: $model.duplicatesOnly, hover: hover)
             FilterIcon(symbol: "1.square", tip: "중복은 1장만 보기", isOn: $model.oneCopyOnly, hover: hover)
+            FilterIcon(symbol: "questionmark.square.dashed",
+                       tip: "유사 의심만 보기 · 파일 이름 앞 18자리(날짜_시각_기종)가 같은 사진 \(model.similarCount.formatted())묶음",
+                       isOn: $model.similarOnly, hover: hover)
             divider
             FilterIcon(symbol: "tag", tip: "사진 라벨 보기 (추정·지정·직접·중복)", isOn: $model.showLabels, hover: hover)
             divider
