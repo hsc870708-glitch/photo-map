@@ -174,6 +174,9 @@ struct Photo: Codable, Identifiable, Hashable {
     var dog: Bool? = nil
     /// 촬영 기종(EXIF 모델 이름). nil이면 아직 안 읽음, ""이면 정보 없음
     var cam: String? = nil
+    /// 촬영 시각의 초 아래 자리(EXIF SubsecTimeOriginal, 보통 0.01초 단위 "64"). nil이면 아직 안 읽음, ""이면 기록 없음.
+    /// 유사 의심 후보(파일 이름 앞 18자리가 같은 사진)만 읽는다
+    var sub: String? = nil
     /// 외장 디스크를 빼 둬서 지금 읽을 수 없는 사진(저장하지 않음). 정보는 그대로 두고 지도에 계속 보여준다
     var offline = false
 
@@ -193,7 +196,7 @@ struct Photo: Codable, Identifiable, Hashable {
     /// 화면에 보여주고 날짜별로 묶을 때 쓰는 날짜(위치 지정 기록은 원래 date 기준이라 그대로 둔다)
     var shownDate: Date? { folderDate ?? date }
 
-    enum CodingKeys: String, CodingKey { case path, lat, lon, date, source, size, hash, mtime, dog, cam }
+    enum CodingKeys: String, CodingKey { case path, lat, lon, date, source, size, hash, mtime, dog, cam, sub }
 
     mutating func prepare() {
         cExt = (path as NSString).pathExtension.lowercased()
@@ -361,6 +364,16 @@ enum Scanner {
         }
         let model = (props[kCGImagePropertyTIFFDictionary] as? [CFString: Any])?[kCGImagePropertyTIFFModel] as? String
         return (date, lat, lon, model)
+    }
+
+    /// 촬영 시각의 초 아래 자리(EXIF SubsecTimeOriginal). 없으면 ""
+    static func subsecond(_ path: String) -> String {
+        guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, [kCGImageSourceShouldCache: false] as CFDictionary)
+                as? [CFString: Any],
+              let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any] else { return "" }
+        let v = exif[kCGImagePropertyExifSubsecTimeOriginal] ?? exif[kCGImagePropertyExifSubsecTime]
+        return (v as? String ?? (v as? NSNumber)?.stringValue ?? "").trimmingCharacters(in: .whitespaces)
     }
 
     /// Spotlight 색인이 없는 디스크의 동영상: 파일 안의 촬영 시각과 위치(ISO 6709 "+35.8744+128.7264/")를 직접 읽는다
@@ -885,7 +898,8 @@ final class Model: ObservableObject {
     func similarCaption(_ p: Photo) -> (text: String, keep: Bool)? {
         guard similarKey[p.path] != nil else { return nil }
         let disk = p.path.hasPrefix("/Volumes/") ? "💾 " + InfoView.place(p.path) + " · " : ""
-        return ((p.path as NSString).lastPathComponent + "\n" + disk + p.parentFolder, false)
+        let sub = (p.sub ?? "").isEmpty ? "" : " (.\(p.sub!)초)"
+        return ((p.path as NSString).lastPathComponent + sub + "\n" + disk + p.parentFolder, false)
     }
 
     func duplicateCaption(_ p: Photo) -> (text: String, keep: Bool)? {
@@ -1229,6 +1243,40 @@ final class Model: ObservableObject {
         notify("저장한 썸네일 \(bytes / 1_048_576)MB를 비웠어요. 볼 때 다시 만들어져요")
     }
 
+    private var readingSub = false
+
+    /// 유사 의심 후보 사진의 초 아래 자리를 파일에서 읽어 기억해 두고 다시 묶는다
+    func readSubseconds(_ paths: [String]) {
+        guard !readingSub else { return }
+        readingSub = true
+        if paths.count > 300 { updateJob("⏱ 유사 의심 사진 시각(0.01초) 확인 중", 0, paths.count) }
+        Task.detached {
+            var out = [String](repeating: "", count: paths.count)
+            let lock = NSLock()
+            var done = 0
+            out.withUnsafeMutableBufferPointer { buf in
+                DispatchQueue.concurrentPerform(iterations: paths.count) { i in
+                    buf[i] = Scanner.subsecond(paths[i])
+                    lock.lock(); done += 1; let d = done; lock.unlock()
+                    if paths.count > 300, d % 200 == 0 {
+                        Task { @MainActor in self.updateJob("⏱ 유사 의심 사진 시각(0.01초) 확인 중", d, paths.count) }
+                    }
+                }
+            }
+            let found = Dictionary(zip(paths, out), uniquingKeysWith: { a, _ in a })
+            await MainActor.run {
+                // 한꺼번에 바꾼다(한 장씩 고치면 느려진다)
+                var list = self.all
+                for i in list.indices { if let v = found[list[i].path] { list[i].sub = v } }
+                self.all = list
+                self.saveCache()
+                self.readingSub = false
+                if self.job?.title.hasPrefix("⏱") == true { self.job = nil }
+                self.resolve()
+            }
+        }
+    }
+
     private func saveCache() {
         if let data = try? JSONEncoder().encode(all) { try? data.write(to: cacheURL) }
     }
@@ -1340,11 +1388,23 @@ final class Model: ObservableObject {
             guard name.count >= 18, name.range(of: "^[0-9]{8}_[0-9]{6}_", options: .regularExpression) != nil else { continue }
             simGroups[String(name.prefix(18)) + (p.isRaw ? "|raw" : ""), default: []].append(p)
         }
+        // 이름이 같으면 그 사진들만 파일을 열어 0.01초 자리까지 비교한다(같은 초 연사가 폴더에 나뉘어 있어도 구분된다)
         var sim: [String: String] = [:]
+        var needSub: [String] = []
         for (k, ps) in simGroups where ps.count > 1 {
             guard Set(ps.map { ($0.path as NSString).deletingLastPathComponent }).count > 1 else { continue }
-            for p in ps { sim[p.path] = k }
+            let unread = ps.filter { $0.sub == nil && !$0.offline }
+            if !unread.isEmpty { needSub += unread.map(\.path); continue }
+            // 초 아래 자리가 같은 것끼리. 기록이 없는 사진은 이름만으로 판단한다
+            let folders = { (xs: [Photo]) in Set(xs.map { ($0.path as NSString).deletingLastPathComponent }).count }
+            let known = Dictionary(grouping: ps.filter { !($0.sub ?? "").isEmpty }, by: { $0.sub! })
+            let unknown = ps.filter { ($0.sub ?? "").isEmpty }
+            for (sub, xs) in known where folders(xs + unknown) > 1 {
+                for p in xs { sim[p.path] = k + "|" + sub }
+            }
+            if !unknown.isEmpty, folders(ps) > 1 { for p in unknown { sim[p.path] = k + "|?" } }
         }
+        if !needSub.isEmpty { readSubseconds(needSub) }
         similarKey = sim
         similarCount = Set(sim.values).count
         // 예전 버전은 경로를 키로 저장했다. 지금 있는 파일이면 새 식별자로 옮긴다
